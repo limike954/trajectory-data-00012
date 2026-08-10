@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	un "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
@@ -613,7 +614,7 @@ func (m *DefaultResourceManager) FetchObservedResources(ctx context.Context, xr 
 	}
 
 	// Extract composed resources from the tree
-	observed := extractComposedResourcesFromTree(tree)
+	observed := extractComposedResourcesFromTree(tree, xr.GetUID())
 
 	m.logger.Debug("Fetched observed composed resources",
 		"xr", xr.GetName(),
@@ -622,10 +623,10 @@ func (m *DefaultResourceManager) FetchObservedResources(ctx context.Context, xr 
 	return observed, nil
 }
 
-// extractComposedResourcesFromTree recursively extracts all composed resources from a resource tree.
+// extractComposedResourcesFromTree recursively extracts composed resources from a resource tree.
 // It returns a flat slice of composed resources, suitable for RenderInputs.ObservedResources.
-// Only includes resources with the crossplane.io/composition-resource-name annotation.
-func extractComposedResourcesFromTree(tree *resource.Resource) []cpd.Unstructured {
+// Only includes annotated resources that are either uncontrolled or controlled by the XR being rendered.
+func extractComposedResourcesFromTree(tree *resource.Resource, xrUID types.UID) []cpd.Unstructured {
 	var resources []cpd.Unstructured
 
 	// Recursively collect composed resources from the tree
@@ -633,8 +634,10 @@ func extractComposedResourcesFromTree(tree *resource.Resource) []cpd.Unstructure
 
 	collectResources = func(node *resource.Resource) {
 		// Only include resources that have the composition-resource-name annotation
-		// (this filters out the root XR and non-composed resources)
-		if _, hasAnno := node.Unstructured.GetAnnotations()["crossplane.io/composition-resource-name"]; hasAnno {
+		// (this filters out the root XR and non-composed resources), and scope
+		// them to the XR being rendered so nested XR children are not observed by
+		// their parent render.
+		if _, hasAnno := node.Unstructured.GetAnnotations()["crossplane.io/composition-resource-name"]; hasAnno && isObservedResourceForXR(&node.Unstructured, xrUID) {
 			// Convert to cpd.Unstructured (composed resource)
 			resources = append(resources, cpd.Unstructured{
 				Unstructured: node.Unstructured,
@@ -653,4 +656,14 @@ func extractComposedResourcesFromTree(tree *resource.Resource) []cpd.Unstructure
 	}
 
 	return resources
+}
+
+func isObservedResourceForXR(obj *un.Unstructured, xrUID types.UID) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Controller != nil && *ref.Controller {
+			return ref.UID == xrUID
+		}
+	}
+
+	return true
 }
