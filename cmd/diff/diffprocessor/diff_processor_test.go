@@ -1,0 +1,3622 @@
+package diffprocessor
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	xp "github.com/limike954/trajectory-data-00012/cmd/diff/client/crossplane"
+	k8 "github.com/limike954/trajectory-data-00012/cmd/diff/client/kubernetes"
+	"github.com/limike954/trajectory-data-00012/cmd/diff/renderer"
+	dt "github.com/limike954/trajectory-data-00012/cmd/diff/renderer/types"
+	tu "github.com/limike954/trajectory-data-00012/cmd/diff/testutils"
+	"github.com/crossplane/cli/v2/cmd/crossplane/common/resource"
+	"github.com/crossplane/cli/v2/cmd/crossplane/render"
+	v1 "github.com/crossplane/function-sdk-go/proto/v1"
+	gcmp "github.com/google/go-cmp/cmp"
+	"github.com/sergi/go-diff/diffmatchpatch"
+	corev1 "k8s.io/api/core/v1"
+	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	un "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
+	cpd "github.com/crossplane/crossplane-runtime/v2/pkg/resource/unstructured/composed"
+	cmp "github.com/crossplane/crossplane-runtime/v2/pkg/resource/unstructured/composite"
+
+	apiextensionsv1 "github.com/crossplane/crossplane/apis/v2/apiextensions/v1"
+	pkgv1 "github.com/crossplane/crossplane/apis/v2/pkg/v1"
+)
+
+// Test constants to avoid duplication.
+const (
+	testGroup      = "example.org"
+	testKind       = "XR1"
+	testPlural     = "xr1s"
+	testSingular   = "xr1"
+	testCRDName    = testPlural + "." + testGroup
+	testXRDName    = testCRDName
+	testAPIVersion = "v1"
+)
+
+// Ensure MockDiffProcessor implements the DiffProcessor interface.
+var _ DiffProcessor = &tu.MockDiffProcessor{}
+
+// mockResourceManagerForSpecMerge is a test helper that returns a backing XR for the spec merge tests.
+// It implements the ResourceManager interface to allow testing resolveBackingXRForClaim.
+type mockResourceManagerForSpecMerge struct {
+	backingXR *un.Unstructured
+}
+
+func (m *mockResourceManagerForSpecMerge) FetchCurrentObject(_ context.Context, _ *un.Unstructured, _ *un.Unstructured) (*un.Unstructured, bool, error) {
+	return m.backingXR, false, nil
+}
+
+func (m *mockResourceManagerForSpecMerge) UpdateOwnerRefs(_ context.Context, _ *un.Unstructured, _ *un.Unstructured) {
+	// No-op for tests
+}
+
+func (m *mockResourceManagerForSpecMerge) FetchObservedResources(_ context.Context, _ *cmp.Unstructured) ([]cpd.Unstructured, error) {
+	return nil, nil
+}
+
+// testProcessorOptions returns sensible default options for tests.
+// Tests can append additional options or override these as needed.
+//
+// The default WithRenderFunc is a no-op that returns an empty CompositionOutputs.
+// The production default would spin up a Docker engine, which unit tests cannot rely on.
+// Tests that need specific render behavior should override via WithRenderFunc.
+func testProcessorOptions(t *testing.T) []ProcessorOption {
+	t.Helper()
+
+	return []ProcessorOption{
+		WithColorize(false),
+		WithCompact(false),
+		WithMaxNestedDepth(10),
+		WithMaxRenderIterations(DefaultMaxRenderIterations),
+		WithLogger(tu.TestLogger(t, false)),
+		WithRenderFunc(func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+			return render.CompositionOutputs{CompositeResource: in.CompositeResource}, nil
+		}),
+	}
+}
+
+func TestDefaultDiffProcessor_PerformDiff(t *testing.T) {
+	// Setup test context
+	ctx := t.Context()
+
+	// Create test resources
+	resource1 := tu.NewResource("example.org/v1", "XR1", "my-xr-1").
+		WithSpecField("coolField", "test-value-1").
+		Build()
+
+	resource2 := tu.NewResource("example.org/v1", "XR1", "my-xr-2").
+		WithSpecField("coolField", "test-value-2").
+		Build()
+
+	// Create a composition for testing
+	composition := tu.NewComposition("test-comp").
+		WithCompositeTypeRef("example.org/v1", "XR1").
+		WithPipelineMode().
+		WithPipelineStep("step1", "function-test", nil).
+		Build()
+
+	// Create a composed resource for testing
+	composedResource := tu.NewResource("cpd.org/v1", "ComposedResource", "resource1").
+		WithCompositeOwner("my-xr-1").
+		WithCompositionResourceName("resA").
+		WithSpecField("param", "value").
+		Build()
+
+	// Test cases
+	tests := map[string]struct {
+		setupMocks      func() (k8.Clients, xp.Clients)
+		resources       []*un.Unstructured
+		processorOpts   []ProcessorOption
+		verifyOutput    func(t *testing.T, output string)
+		want            error
+		validationError bool
+	}{
+		"NoResources": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema:   tu.NewMockSchemaClient().Build(),
+					Type:     tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create Crossplane client mocks
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().Build(),
+					Credential:  &tu.MockCredentialClient{},
+					Definition:  tu.NewMockDefinitionClient().Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function:     tu.NewMockFunctionClient().Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			resources:     []*un.Unstructured{},
+			processorOpts: testProcessorOptions(t),
+			want:          nil,
+		},
+		"DiffSingleResourceError": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema:   tu.NewMockSchemaClient().Build(),
+					Type:     tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create Crossplane client mocks
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithNoMatchingComposition().
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function:     tu.NewMockFunctionClient().Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			resources:     []*un.Unstructured{resource1},
+			processorOpts: testProcessorOptions(t),
+			// Note: Error output now goes to stderr (see TestDefaultDiffProcessor_PerformDiff_StderrErrorOutput)
+			// This test verifies the error return value, not stderr output
+			verifyOutput: nil,
+			want:         errors.New("unable to process resource XR1/my-xr-1: cannot get composition: composition not found"),
+		},
+		"MultipleResourceErrors": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema:   tu.NewMockSchemaClient().Build(),
+					Type:     tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create Crossplane client mocks
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithNoMatchingComposition().
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function:     tu.NewMockFunctionClient().Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			resources:     []*un.Unstructured{resource1, resource2},
+			processorOpts: testProcessorOptions(t),
+			// Note: Error output now goes to stderr (see TestDefaultDiffProcessor_PerformDiff_StderrErrorOutput)
+			// This test verifies the error return value, not stderr output
+			verifyOutput: nil,
+			want: errors.New("[unable to process resource XR1/my-xr-1: cannot get composition: composition not found, " +
+				"unable to process resource XR1/my-xr-2: cannot get composition: composition not found]"),
+		},
+		"CompositionNotFound": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema:   tu.NewMockSchemaClient().Build(),
+					Type:     tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create Crossplane client mocks
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithNoMatchingComposition().
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function:     tu.NewMockFunctionClient().Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			resources:     []*un.Unstructured{resource1},
+			processorOpts: testProcessorOptions(t),
+			want:          errors.New("unable to process resource XR1/my-xr-1: cannot get composition: composition not found"),
+		},
+		"GetFunctionsError": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema:   tu.NewMockSchemaClient().Build(),
+					Type:     tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create Crossplane client mocks
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithSuccessfulCompositionMatch(composition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithFailedFunctionsFetch("function not found").
+						Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			resources:     []*un.Unstructured{resource1},
+			processorOpts: testProcessorOptions(t),
+			want:          errors.New("unable to process resource XR1/my-xr-1: cannot get functions for composition: cannot get functions from pipeline: function not found"),
+		},
+		"SuccessfulDiff": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create mock functions that render will call successfully
+				functions := []pkgv1.Function{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "function-test",
+						},
+					},
+				}
+
+				// Create CRDs upfront to avoid recreating them in closures
+				mainCRD := makeTestCRD(testCRDName, testKind, testGroup, testAPIVersion)
+				composedCRD := makeTestCRD("composedresources.cpd.org", "ComposedResource", "cpd.org", "v1")
+
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply: tu.NewMockApplyClient().
+						WithSuccessfulDryRun().
+						Build(),
+					Resource: tu.NewMockResourceClient().
+						WithResourcesExist(resource1, composedResource). // Add resources to existing resources
+						WithResourcesFoundByLabel([]*un.Unstructured{composedResource}, "crossplane.io/composite", "test-xr").
+						Build(),
+					Schema: tu.NewMockSchemaClient().
+						WithNoResourcesRequiringCRDs().
+						WithGetCRD(func(_ context.Context, gvk schema.GroupVersionKind) (*extv1.CustomResourceDefinition, error) {
+							if gvk.Group == testGroup && gvk.Kind == testKind {
+								return mainCRD, nil
+							}
+
+							if gvk.Group == "cpd.org" && gvk.Kind == "ComposedResource" {
+								return composedCRD, nil
+							}
+
+							return nil, errors.New("CRD not found")
+						}).
+						WithGetCRDByName(func(name string) (*extv1.CustomResourceDefinition, error) {
+							if name == testCRDName {
+								return mainCRD, nil
+							}
+
+							if name == "composedresources.cpd.org" {
+								return composedCRD, nil
+							}
+
+							return nil, errors.Errorf("CRD with name %s not found", name)
+						}).
+						Build(),
+					Type: tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create XRD for composed resource
+				composedXRD := tu.NewXRD("composedresources.cpd.org", "cpd.org", "ComposedResource").
+					WithPlural("composedresources").
+					WithSingular("composedresource").
+					WithVersion("v1", true, true).
+					WithSchema(&extv1.JSONSchemaProps{
+						Type: "object",
+						Properties: map[string]extv1.JSONSchemaProps{
+							"spec": {
+								Type: "object",
+								Properties: map[string]extv1.JSONSchemaProps{
+									"param": {Type: "string"},
+								},
+							},
+							"status": {Type: "object"},
+						},
+					}).
+					BuildAsUnstructured()
+
+				// Create main XRD
+				mainXRD := tu.NewXRD(testXRDName, testGroup, testKind).
+					WithPlural(testPlural).
+					WithSingular(testSingular).
+					WithVersion("v1", true, true).
+					WithSchema(&extv1.JSONSchemaProps{
+						Type: "object",
+						Properties: map[string]extv1.JSONSchemaProps{
+							"spec": {
+								Type: "object",
+								Properties: map[string]extv1.JSONSchemaProps{
+									"field": {Type: "string"},
+								},
+							},
+							"status": {Type: "object"},
+						},
+					}).
+					BuildAsUnstructured()
+
+				// Create Crossplane client mocks
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithSuccessfulCompositionMatch(composition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithEmptyXRDsFetch().
+						WithXRDForGVK(schema.GroupVersionKind{Group: testGroup, Version: "v1", Kind: testKind}, mainXRD).
+						WithXRDForGVK(schema.GroupVersionKind{Group: "cpd.org", Version: "v1", Kind: "ComposedResource"}, composedXRD).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithSuccessfulFunctionsFetch(functions).
+						Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().
+						WithEmptyResourceTree().
+						Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			resources: []*un.Unstructured{resource1},
+			processorOpts: append(testProcessorOptions(t),
+				WithRenderFunc(func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					// Only return composed resources for the main XR, not for nested XRs
+					// to avoid infinite recursion
+					if in.CompositeResource.GetKind() == testKind {
+						return render.CompositionOutputs{
+							CompositeResource: in.CompositeResource,
+							ComposedResources: []cpd.Unstructured{
+								{
+									Unstructured: un.Unstructured{
+										Object: composedResource.Object,
+									},
+								},
+							},
+						}, nil
+					}
+					// For nested XRs, just return the XR itself with no composed resources
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+					}, nil
+				}),
+				// Override the schema validator factory to use a simple validator
+				WithSchemaValidatorFactory(func(k8.SchemaClient, xp.DefinitionClient, logging.Logger) SchemaValidator {
+					return &tu.MockSchemaValidator{
+						ValidateResourcesFn: func(context.Context, *un.Unstructured, []cpd.Unstructured) error {
+							return nil
+						},
+					}
+				}),
+				// Override the diff calculator factory to return actual diffs
+				WithDiffCalculatorFactory(func(k8.ApplyClient, xp.ResourceTreeClient, ResourceManager, logging.Logger, renderer.DiffOptions) DiffCalculator {
+					return &tu.MockDiffCalculator{
+						CalculateNonRemovalDiffsFn: func(context.Context, *cmp.Unstructured, *un.Unstructured, render.CompositionOutputs) (map[string]*dt.ResourceDiff, map[string]bool, error) {
+							diffs := make(map[string]*dt.ResourceDiff)
+							rendered := make(map[string]bool)
+
+							// Add a modified diff (not just equal)
+							lineDiffs := []diffmatchpatch.Diff{
+								{Type: diffmatchpatch.DiffDelete, Text: "  field: old-value"},
+								{Type: diffmatchpatch.DiffInsert, Text: "  field: new-value"},
+							}
+
+							diffKey1 := "example.org/v1/XR1/test-xr"
+							diffs[diffKey1] = &dt.ResourceDiff{
+								Gvk:          schema.GroupVersionKind{Group: "example.org", Version: "v1", Kind: "XR1"},
+								ResourceName: "test-xr",
+								DiffType:     dt.DiffTypeModified,
+								LineDiffs:    lineDiffs,                                          // Add line diffs
+								Current:      dt.ResourceViews{Raw: resource1, Clean: resource1}, // for completeness
+								Desired:      dt.ResourceViews{Raw: resource1, Clean: resource1}, // for completeness
+							}
+							rendered[diffKey1] = true
+
+							// Add a composed resource diff that's also modified
+							diffKey2 := "example.org/v1/ComposedResource/resource-a"
+							diffs[diffKey2] = &dt.ResourceDiff{
+								Gvk:          schema.GroupVersionKind{Group: "example.org", Version: "v1", Kind: "ComposedResource"},
+								ResourceName: "resource-a",
+								DiffType:     dt.DiffTypeModified,
+								LineDiffs:    lineDiffs,
+								Current:      dt.ResourceViews{Raw: composedResource, Clean: composedResource},
+								Desired:      dt.ResourceViews{Raw: composedResource, Clean: composedResource},
+							}
+							rendered[diffKey2] = true
+
+							return diffs, rendered, nil
+						},
+					}
+				}),
+				// Override the diff renderer factory to produce actual output
+				// The factory receives DiffOptions which contains Stdout where output should be written
+				WithDiffRendererFactory(func(_ logging.Logger, opts renderer.DiffOptions) renderer.DiffRenderer {
+					return &tu.MockDiffRenderer{
+						RenderDiffsFn: func(_ map[string]*dt.ResourceDiff, _ []dt.OutputError) error {
+							// Write a simple summary to the output via opts.Stdout
+							w := opts.Stdout
+
+							_, err := fmt.Fprintln(w, "Changes will be applied to 2 resources:")
+							if err != nil {
+								return err
+							}
+
+							_, err = fmt.Fprintln(w, "- example.org/v1/XR1/test-xr will be modified")
+							if err != nil {
+								return err
+							}
+
+							_, err = fmt.Fprintln(w, "- example.org/v1/ComposedResource/resource-a will be modified")
+							if err != nil {
+								return err
+							}
+
+							_, err = fmt.Fprintln(w, "\nSummary: 0 to create, 2 to modify, 0 to delete")
+
+							return err
+						},
+					}
+				}),
+			),
+			verifyOutput: func(t *testing.T, output string) {
+				t.Helper()
+				// We should have some output from the diff
+				if output == "" {
+					t.Errorf("Expected non-empty diff output")
+				}
+
+				// Simple check for expected output format
+				if !strings.Contains(output, "Summary:") {
+					t.Errorf("Expected diff output to contain a Summary section")
+				}
+			},
+			want: nil,
+		},
+		"ValidationError": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create mock functions that render will call successfully
+				functions := []pkgv1.Function{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "function-test",
+						},
+					},
+				}
+
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply: tu.NewMockApplyClient().
+						WithSuccessfulDryRun().
+						Build(),
+					Resource: tu.NewMockResourceClient().
+						WithResourcesExist(resource1).
+						Build(),
+					Schema: tu.NewMockSchemaClient().
+						WithNoResourcesRequiringCRDs().
+						WithGetCRD(func(_ context.Context, gvk schema.GroupVersionKind) (*extv1.CustomResourceDefinition, error) {
+							if gvk.Group == testGroup && gvk.Kind == testKind {
+								return makeTestCRD(testCRDName, testKind, testGroup, testAPIVersion), nil
+							}
+
+							if gvk.Group == "cpd.org" && gvk.Kind == "ComposedResource" {
+								return makeTestCRD("composedresources.cpd.org", "ComposedResource", "cpd.org", "v1"), nil
+							}
+
+							return nil, errors.New("CRD not found")
+						}).
+						WithSuccessfulCRDByNameFetch(testCRDName, makeTestCRD(testCRDName, testKind, testGroup, testAPIVersion)).
+						Build(),
+					Type: tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create Crossplane client mocks
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithSuccessfulCompositionMatch(composition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRDForXR(tu.NewXRD(testXRDName, testGroup, testKind).
+							WithPlural(testPlural).
+							WithSingular(testSingular).
+							BuildAsUnstructured()).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithSuccessfulFunctionsFetch(functions).
+						Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			resources: []*un.Unstructured{resource1},
+			processorOpts: append(testProcessorOptions(t),
+				WithRenderFunc(func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					// Return valid render outputs
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{
+							{
+								Unstructured: un.Unstructured{
+									Object: composedResource.Object,
+								},
+							},
+						},
+					}, nil
+				}),
+				// Override with a validator that fails
+				WithSchemaValidatorFactory(func(_ k8.SchemaClient, _ xp.DefinitionClient, _ logging.Logger) SchemaValidator {
+					return &tu.MockSchemaValidator{
+						ValidateResourcesFn: func(context.Context, *un.Unstructured, []cpd.Unstructured) error {
+							return errors.New("validation error")
+						},
+					}
+				}),
+			),
+			want:            errors.New("unable to process resource XR1/my-xr-1: cannot validate resources: validation error"),
+			validationError: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Create components for testing
+			k8sClients, xpClients := tt.setupMocks()
+
+			// Create stdout buffer and add it to processor options so renderers can access it
+			var stdout bytes.Buffer
+
+			opts := append([]ProcessorOption{}, tt.processorOpts...)
+			opts = append(opts, WithStdout(&stdout))
+
+			// Create the diff processor
+			processor := NewDiffProcessor(k8sClients, xpClients, opts...)
+
+			// Create a mock composition provider that uses the same mock composition client
+			compositionProvider := func(ctx context.Context, res *un.Unstructured) (*apiextensionsv1.Composition, error) {
+				return xpClients.Composition.FindMatchingComposition(ctx, res)
+			}
+			_, err := processor.PerformDiff(ctx, tt.resources, compositionProvider)
+
+			// Check output if verification function is provided (do this first, before error checks)
+			if tt.verifyOutput != nil {
+				tt.verifyOutput(t, stdout.String())
+			}
+
+			if tt.want != nil {
+				if err == nil {
+					t.Errorf("PerformDiff(...): expected error but got none")
+					return
+				}
+
+				if diff := gcmp.Diff(tt.want.Error(), err.Error()); diff != "" {
+					t.Errorf("PerformDiff(...): -want error, +got error:\n%s", diff)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Errorf("PerformDiff(...): unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestDefaultDiffProcessor_PerformDiff_StderrErrorOutput verifies that when
+// resource processing fails, detailed errors are written to stderr for human visibility.
+// This tests the WithStderr option and the stderr error output path.
+func TestDefaultDiffProcessor_PerformDiff_StderrErrorOutput(t *testing.T) {
+	ctx := t.Context()
+
+	// Create test resource
+	resource := tu.NewResource("example.org/v1", "XR1", "my-xr-1").
+		WithSpecField("coolField", "test-value-1").
+		Build()
+
+	// Create stderr buffer to capture error output
+	var stderrBuf bytes.Buffer
+
+	// Create Kubernetes client mocks
+	k8sClients := k8.Clients{
+		Apply:    tu.NewMockApplyClient().Build(),
+		Resource: tu.NewMockResourceClient().Build(),
+		Schema:   tu.NewMockSchemaClient().Build(),
+		Type:     tu.NewMockTypeConverter().Build(),
+	}
+
+	// Create Crossplane client mocks with a failing composition match
+	xpClients := xp.Clients{
+		Composition: tu.NewMockCompositionClient().
+			WithNoMatchingComposition().
+			Build(),
+		Credential: &tu.MockCredentialClient{},
+		Definition: tu.NewMockDefinitionClient().Build(),
+		Environment: tu.NewMockEnvironmentClient().
+			WithNoEnvironmentConfigs().
+			Build(),
+		Function:     tu.NewMockFunctionClient().Build(),
+		ResourceTree: tu.NewMockResourceTreeClient().Build(),
+	}
+
+	// Create processor with custom stderr buffer
+	processor := NewDiffProcessor(k8sClients, xpClients,
+		append(testProcessorOptions(t),
+			WithStderr(&stderrBuf), // Inject test buffer to capture stderr
+		)...,
+	)
+
+	// Create composition provider using mock client
+	compositionProvider := func(ctx context.Context, res *un.Unstructured) (*apiextensionsv1.Composition, error) {
+		return xpClients.Composition.FindMatchingComposition(ctx, res)
+	}
+
+	// Run the diff
+	_, err := processor.PerformDiff(ctx, []*un.Unstructured{resource}, compositionProvider)
+
+	// Should return an error
+	if err == nil {
+		t.Fatal("PerformDiff() expected error but got none")
+	}
+
+	// Verify stderr contains the error output
+	stderrOutput := stderrBuf.String()
+
+	// The error should be formatted using FormatError() which produces:
+	// "ERROR: {ResourceID}: {Message}"
+	if !strings.Contains(stderrOutput, "ERROR: XR1/my-xr-1:") {
+		t.Errorf("Expected stderr to contain 'ERROR: XR1/my-xr-1:', got: %q", stderrOutput)
+	}
+
+	if !strings.Contains(stderrOutput, "composition not found") {
+		t.Errorf("Expected stderr to contain 'composition not found' error detail, got: %q", stderrOutput)
+	}
+}
+
+func TestDefaultDiffProcessor_Initialize(t *testing.T) {
+	// Setup test context
+	ctx := t.Context()
+
+	// Create test resources
+	xrd1 := tu.NewResource("apiextensions.crossplane.io/v1", "CompositeResourceDefinition", "xrd1").
+		WithSpecField("group", "example.org").
+		WithSpecField("names", map[string]any{
+			"kind":     "XExampleResource",
+			"plural":   "xexampleresources",
+			"singular": "xexampleresource",
+		}).
+		Build()
+
+	// Test cases
+	tests := map[string]struct {
+		setupMocks    func() (k8.Clients, xp.Clients)
+		processorOpts []ProcessorOption
+		want          error
+	}{
+		"XRDsError": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema:   tu.NewMockSchemaClient().Build(),
+					Type:     tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create Crossplane client mocks with a failing Definition client
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().Build(),
+					Credential:  &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithFailedXRDsFetch("XRD not found").
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function:     tu.NewMockFunctionClient().Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			processorOpts: testProcessorOptions(t),
+			want:          errors.Wrap(errors.Wrap(errors.New("XRD not found"), "cannot get XRDs"), "cannot load CRDs"),
+		},
+		"EnvConfigsError": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema:   tu.NewMockSchemaClient().Build(),
+					Type:     tu.NewMockTypeConverter().Build(),
+				}
+
+				// Create Crossplane client mocks with a failing Environment client
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().Build(),
+					Credential:  &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithEmptyXRDsFetch().
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithGetEnvironmentConfigs(func(_ context.Context) ([]*un.Unstructured, error) {
+							return nil, errors.New("env configs not found")
+						}).
+						Build(),
+					Function:     tu.NewMockFunctionClient().Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			processorOpts: testProcessorOptions(t),
+			want:          errors.Wrap(errors.New("env configs not found"), "cannot get environment configs"),
+		},
+		"Success": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create Kubernetes client mocks
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema:   tu.NewMockSchemaClient().Build(),
+					Type: tu.NewMockTypeConverter().
+						WithDefaultGVKToGVR().
+						Build(),
+				}
+
+				// Create Crossplane client mocks with successful initialization
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().Build(),
+					Credential:  &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithSuccessfulXRDsFetch([]*un.Unstructured{xrd1}).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function:     tu.NewMockFunctionClient().Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			processorOpts: testProcessorOptions(t),
+			want:          nil,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Get the clients for this test
+			k8sClients, xpClients := tc.setupMocks()
+
+			// Build processor options
+			options := tc.processorOpts
+
+			// Create the processor
+			processor := NewDiffProcessor(k8sClients, xpClients, options...)
+
+			// Call the Initialize method
+			err := processor.Initialize(ctx)
+
+			// Verify error expectations
+			if tc.want != nil {
+				if err == nil {
+					t.Errorf("Initialize(...): expected error but got none")
+					return
+				}
+
+				if diff := gcmp.Diff(tc.want.Error(), err.Error()); diff != "" {
+					t.Errorf("Initialize(...): -want error, +got error:\n%s", diff)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Initialize(...): unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestDefaultDiffProcessor_RenderToStableState(t *testing.T) {
+	ctx := t.Context()
+
+	// Create test resources
+	xr := tu.NewResource("example.org/v1", "XR", "test-xr").BuildUComposite()
+
+	// Create a composition with pipeline mode
+	pipelineMode := apiextensionsv1.CompositionModePipeline
+	composition := &apiextensionsv1.Composition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-composition",
+		},
+		Spec: apiextensionsv1.CompositionSpec{
+			Mode: pipelineMode,
+		},
+	}
+
+	// Create test functions
+	functions := []pkgv1.Function{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-function",
+			},
+		},
+	}
+
+	// Create test resources for requirements
+	const (
+		ConfigMap     = "ConfigMap"
+		ConfigMapName = "config1"
+	)
+
+	configMap := tu.NewResource("v1", ConfigMap, ConfigMapName).Build()
+	secret := tu.NewResource("v1", "Secret", "secret1").Build()
+
+	tests := map[string]struct {
+		xr                     *cmp.Unstructured
+		composition            *apiextensionsv1.Composition
+		functions              []pkgv1.Function
+		resourceID             string
+		observedResources      []cpd.Unstructured
+		setupResourceClient    func() *tu.MockResourceClient
+		setupEnvironmentClient func() *tu.MockEnvironmentClient
+		setupRenderFunc        func() RenderFn
+		wantComposedCount      int
+		wantRenderIterations   int
+		wantErr                bool
+	}{
+		"NoRequirements": {
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().
+					Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				iteration := 0
+
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					iteration++
+					// Return a simple output with no requirements
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{
+							{Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "ComposedResource",
+								"metadata": map[string]any{
+									"name": "composed1",
+								},
+							}}},
+						},
+					}, nil
+				}
+			},
+			wantComposedCount:    1,
+			wantRenderIterations: 1, // Only renders once when no requirements
+			wantErr:              false,
+		},
+		"SingleIterationWithRequirements": {
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().
+					WithNamespacedResource(
+						schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
+					).
+					WithGetResource(func(_ context.Context, gvk schema.GroupVersionKind, _, name string) (*un.Unstructured, error) {
+						if gvk.Kind == ConfigMap && name == ConfigMapName {
+							return configMap, nil
+						}
+
+						return nil, errors.New("resource not found")
+					}).
+					Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				iteration := 0
+
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					iteration++
+
+					// First render includes requirements, second should have no requirements
+					var reqs []*v1.ResourceSelector
+					if iteration == 1 {
+						reqs = []*v1.ResourceSelector{
+							{
+								ApiVersion: "v1",
+								Kind:       ConfigMap,
+								Match: &v1.ResourceSelector_MatchName{
+									MatchName: ConfigMapName,
+								},
+							},
+						}
+					}
+
+					// Return a simple output
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{
+							{Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "ComposedResource",
+								"metadata": map[string]any{
+									"name": "composed1",
+								},
+							}}},
+						},
+						RequiredResources: reqs,
+					}, nil
+				}
+			},
+			wantComposedCount:    1,
+			wantRenderIterations: 2, // Renders once with requirements, then once more to confirm no new requirements
+			wantErr:              false,
+		},
+		"MultipleIterationsWithRequirements": {
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().
+					WithNamespacedResource(
+						schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
+						schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Secret"},
+					).
+					WithGetResource(func(_ context.Context, gvk schema.GroupVersionKind, _, name string) (*un.Unstructured, error) {
+						if gvk.Kind == ConfigMap && name == ConfigMapName {
+							return configMap, nil
+						}
+
+						if gvk.Kind == "Secret" && name == "secret1" {
+							return secret, nil
+						}
+
+						return nil, errors.New("resource not found")
+					}).
+					Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				iteration := 0
+
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					iteration++
+
+					// Track existing resources to simulate dependencies
+					hasConfig := false
+					hasSecret := false
+
+					for _, res := range in.RequiredResources {
+						if res.GetKind() == ConfigMap && res.GetName() == ConfigMapName {
+							hasConfig = true
+						}
+
+						if res.GetKind() == "Secret" && res.GetName() == "secret1" {
+							hasSecret = true
+						}
+					}
+
+					// Build requirements based on what we already have
+					var requirements []*v1.ResourceSelector
+
+					if !hasConfig {
+						// First iteration - request ConfigMap
+						requirements = []*v1.ResourceSelector{
+							{
+								ApiVersion: "v1",
+								Kind:       ConfigMap,
+								Match: &v1.ResourceSelector_MatchName{
+									MatchName: ConfigMapName,
+								},
+							},
+						}
+					} else if !hasSecret {
+						// Second iteration - request Secret
+						requirements = []*v1.ResourceSelector{
+							{
+								ApiVersion: "v1",
+								Kind:       "Secret",
+								Match: &v1.ResourceSelector_MatchName{
+									MatchName: "secret1",
+								},
+							},
+						}
+					}
+
+					// Return a simple output
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{
+							{Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "ComposedResource",
+								"metadata": map[string]any{
+									"name": "composed1",
+								},
+							}}},
+						},
+						RequiredResources: requirements,
+					}, nil
+				}
+			},
+			wantComposedCount:    1,
+			wantRenderIterations: 3, // Iterations: 1. Request ConfigMap, 2. Request Secret, 3. No more requirements
+			wantErr:              false,
+		},
+		"RenderError": {
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				return func(context.Context, logging.Logger, RenderInputs) (render.CompositionOutputs, error) {
+					return render.CompositionOutputs{}, errors.New("render error")
+				}
+			},
+			wantComposedCount:    0,
+			wantRenderIterations: 1,
+			wantErr:              true,
+		},
+		"RenderErrorWithRequirements": {
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().
+					WithNamespacedResource(
+						schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
+					).
+					WithGetResource(func(_ context.Context, gvk schema.GroupVersionKind, _, name string) (*un.Unstructured, error) {
+						if gvk.Kind == ConfigMap && name == ConfigMapName {
+							return configMap, nil
+						}
+
+						return nil, errors.New("resource not found")
+					}).
+					Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				iteration := 0
+
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					iteration++
+
+					// First render has requirements but errors
+					if iteration == 1 {
+						reqs := []*v1.ResourceSelector{
+							{
+								ApiVersion: "v1",
+								Kind:       ConfigMap,
+								Match: &v1.ResourceSelector_MatchName{
+									MatchName: ConfigMapName,
+								},
+							},
+						}
+
+						return render.CompositionOutputs{
+							RequiredResources: reqs,
+						}, errors.New("render error with requirements")
+					}
+
+					// Second render succeeds
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{
+							{Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "ComposedResource",
+								"metadata": map[string]any{
+									"name": "composed1",
+								},
+							}}},
+						},
+					}, nil
+				}
+			},
+			wantComposedCount:    1,
+			wantRenderIterations: 2,     // Renders once with error but requirements, then once more successfully
+			wantErr:              false, // Should not error as the second render succeeds
+		},
+		"RenderErrorWithCachedRequirements": {
+			// Regression test: render fails with a fatal error and returns requirements,
+			// but all requirements are already cached (newReqCount==0). The error must be
+			// returned instead of silently dropped. Previously the condition also required
+			// len(output.Requirements)==0, which let errors fall through to checkStability
+			// and return an output with nil CompositeResource, causing a SIGSEGV.
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().
+					WithNamespacedResource(
+						schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
+					).
+					WithGetResource(func(_ context.Context, gvk schema.GroupVersionKind, _, name string) (*un.Unstructured, error) {
+						if gvk.Kind == ConfigMap && name == ConfigMapName {
+							return configMap, nil
+						}
+
+						return nil, errors.New("resource not found")
+					}).
+					Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				reqs := []*v1.ResourceSelector{
+					{
+						ApiVersion: "v1",
+						Kind:       ConfigMap,
+						Match: &v1.ResourceSelector_MatchName{
+							MatchName: ConfigMapName,
+						},
+					},
+				}
+
+				iteration := 0
+
+				return func(_ context.Context, _ logging.Logger, _ RenderInputs) (render.CompositionOutputs, error) {
+					iteration++
+
+					// Every iteration returns the same requirements AND the same error.
+					// After iteration 1, the requirement is already cached so newReqCount==0.
+					return render.CompositionOutputs{
+						RequiredResources: reqs,
+					}, errors.New("fatal template error: assignment to entry in nil map")
+				}
+			},
+			wantComposedCount:    0,
+			wantRenderIterations: 2,    // First render resolves the requirement, second sees no new requirements
+			wantErr:              true, // Must return error, not silently swallow it
+		},
+		"RequirementsProcessingError": {
+			// A transport-level / non-NotFound failure during requirement
+			// resolution must still propagate (e.g. RBAC denial, API server
+			// unreachable). The NotFound case is exercised in
+			// RequirementsNotFoundConverges below.
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().
+					WithNamespacedResource(
+						schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
+					).
+					WithGetResourceError(errors.New("forbidden: user cannot get configmaps")).
+					Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					reqs := []*v1.ResourceSelector{
+						{
+							ApiVersion: "v1",
+							Kind:       ConfigMap,
+							Match: &v1.ResourceSelector_MatchName{
+								MatchName: "missing-config",
+							},
+						},
+					}
+
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						RequiredResources: reqs,
+					}, nil
+				}
+			},
+			wantComposedCount:    0,
+			wantRenderIterations: 1,
+			wantErr:              true, // Non-NotFound errors still surface.
+		},
+		"RequirementsNotFoundConverges": {
+			// Regression test for limike954/trajectory-data-00012#355: a
+			// matchName selector whose target does not exist must NOT abort
+			// the diff. The render loop converges on iteration 1 — render
+			// emits the selector, ResolveSelectors silently skips the
+			// NotFound (mirrors upstream xfn.required_resources.go), no new
+			// requirements are accumulated, the stability check fires.
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().
+					WithNamespacedResource(
+						schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
+					).
+					WithResourceNotFound().
+					Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					reqs := []*v1.ResourceSelector{
+						{
+							ApiVersion: "v1",
+							Kind:       ConfigMap,
+							Match: &v1.ResourceSelector_MatchName{
+								MatchName: "missing-config",
+							},
+						},
+					}
+
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						RequiredResources: reqs,
+					}, nil
+				}
+			},
+			wantComposedCount:    0,
+			wantRenderIterations: 1,
+			wantErr:              false,
+		},
+		"ObservedResourcesPassedToRenderFunc": {
+			xr:          xr,
+			composition: composition,
+			functions:   functions,
+			resourceID:  "XR/test-xr",
+			observedResources: []cpd.Unstructured{
+				{Unstructured: un.Unstructured{Object: map[string]any{
+					"apiVersion": "s3.aws.crossplane.io/v1",
+					"kind":       "Bucket",
+					"metadata": map[string]any{
+						"name": "observed-bucket",
+						"annotations": map[string]any{
+							"crossplane.io/composition-resource-name": "bucket",
+						},
+					},
+				}}},
+				{Unstructured: un.Unstructured{Object: map[string]any{
+					"apiVersion": "iam.aws.crossplane.io/v1",
+					"kind":       "User",
+					"metadata": map[string]any{
+						"name": "observed-user",
+						"annotations": map[string]any{
+							"crossplane.io/composition-resource-name": "user",
+						},
+					},
+				}}},
+			},
+			setupResourceClient: func() *tu.MockResourceClient {
+				return tu.NewMockResourceClient().Build()
+			},
+			setupEnvironmentClient: func() *tu.MockEnvironmentClient {
+				return tu.NewMockEnvironmentClient().
+					WithNoEnvironmentConfigs().
+					Build()
+			},
+			setupRenderFunc: func() RenderFn {
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					// Verify observed resources were passed through
+					if len(in.ObservedResources) != 2 {
+						return render.CompositionOutputs{}, errors.Errorf("expected 2 observed resources, got %d", len(in.ObservedResources))
+					}
+
+					// Verify the observed resources have the expected kinds
+					observedKinds := make(map[string]bool)
+					for _, obs := range in.ObservedResources {
+						observedKinds[obs.GetKind()] = true
+					}
+
+					if !observedKinds["Bucket"] || !observedKinds["User"] {
+						return render.CompositionOutputs{}, errors.New("expected observed resources to include Bucket and User")
+					}
+
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{
+							{Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "ComposedResource",
+								"metadata": map[string]any{
+									"name": "composed1",
+								},
+							}}},
+						},
+					}, nil
+				}
+			},
+			wantComposedCount:    1,
+			wantRenderIterations: 1,
+			wantErr:              false,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Set up mock clients
+			resourceClient := tt.setupResourceClient()
+			environmentClient := tt.setupEnvironmentClient()
+
+			// Create a logger
+			logger := tu.TestLogger(t, false)
+			renderFunc := tt.setupRenderFunc()
+
+			// Create a render iteration counter to verify
+			renderCount := 0
+			countingRenderFunc := func(ctx context.Context, log logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+				renderCount++
+				return renderFunc(ctx, log, in)
+			}
+
+			// Create the requirements provider
+			requirementsProvider := NewRequirementsProvider(
+				resourceClient,
+				environmentClient,
+				logger,
+			)
+
+			// Build processor options
+			baseOpts := testProcessorOptions(t)
+			customOpts := []ProcessorOption{
+				WithLogger(logger),
+				WithRenderFunc(countingRenderFunc),
+				WithRequirementsProviderFactory(func(k8.ResourceClient, xp.EnvironmentClient, logging.Logger) *RequirementsProvider {
+					return requirementsProvider
+				}),
+			}
+			baseOpts = append(baseOpts, customOpts...)
+			processor := NewDiffProcessor(k8.Clients{}, xp.Clients{Definition: tu.NewMockDefinitionClient().Build()}, baseOpts...)
+
+			// Call the method under test
+			output, err := processor.(*DefaultDiffProcessor).RenderToStableState(ctx, tt.xr, tt.composition, tt.functions, tt.resourceID, tt.observedResources, false)
+
+			// Check error expectations
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("RenderToStableState() expected error but got none")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Errorf("RenderToStableState() unexpected error: %v", err)
+				return
+			}
+
+			// Check render iterations
+			if renderCount != tt.wantRenderIterations {
+				t.Errorf("RenderToStableState() called render func %d times, want %d",
+					renderCount, tt.wantRenderIterations)
+			}
+
+			// Check composed resource count
+			if len(output.ComposedResources) != tt.wantComposedCount {
+				t.Errorf("RenderToStableState() returned %d composed resources, want %d",
+					len(output.ComposedResources), tt.wantComposedCount)
+			}
+		})
+	}
+}
+
+func TestDefaultDiffProcessor_RenderToStableState_SynthesizeReady(t *testing.T) {
+	ctx := t.Context()
+
+	// Create test resources
+	xr := tu.NewResource("example.org/v1", "XR", "test-xr").BuildUComposite()
+
+	// Create a composition with pipeline mode
+	pipelineMode := apiextensionsv1.CompositionModePipeline
+	composition := &apiextensionsv1.Composition{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-composition"},
+		Spec:       apiextensionsv1.CompositionSpec{Mode: pipelineMode},
+	}
+
+	functions := []pkgv1.Function{{ObjectMeta: metav1.ObjectMeta{Name: "test-function"}}}
+
+	tests := map[string]struct {
+		setupRenderFunc      func() RenderFn
+		wantComposedCount    int
+		wantRenderIterations int
+		wantErr              bool
+		wantErrContains      string
+	}{
+		"AlreadyStable": {
+			setupRenderFunc: func() RenderFn {
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					// Return same resource every time - already stable
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{{
+							Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "ComposedResource",
+								"metadata":   map[string]any{"name": "composed1"},
+							}},
+						}},
+					}, nil
+				}
+			},
+			wantComposedCount:    1,
+			wantRenderIterations: 2, // First render + verification render
+			wantErr:              false,
+		},
+		"MultiStageProgression": {
+			setupRenderFunc: func() RenderFn {
+				iteration := 0
+
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					iteration++
+
+					// Count how many observed resources have Ready=True
+					readyCount := 0
+
+					for _, obs := range in.ObservedResources {
+						if hasReadyCondition(&obs.Unstructured) {
+							readyCount++
+						}
+					}
+
+					// Stage 1: No ready resources -> produce resource1
+					// Stage 2: resource1 is ready -> produce resource1 + resource2
+					// Stage 3: resource1,2 ready -> produce resource1 + resource2 + resource3
+					// Stage 4: All ready, stable
+					resources := []cpd.Unstructured{{
+						Unstructured: un.Unstructured{Object: map[string]any{
+							"apiVersion": "example.org/v1",
+							"kind":       "Stage1Resource",
+							"metadata":   map[string]any{"name": "resource1"},
+						}},
+					}}
+
+					if readyCount >= 1 {
+						resources = append(resources, cpd.Unstructured{
+							Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "Stage2Resource",
+								"metadata":   map[string]any{"name": "resource2"},
+							}},
+						})
+					}
+
+					if readyCount >= 2 {
+						resources = append(resources, cpd.Unstructured{
+							Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "Stage3Resource",
+								"metadata":   map[string]any{"name": "resource3"},
+							}},
+						})
+					}
+
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: resources,
+					}, nil
+				}
+			},
+			wantComposedCount:    3, // All three stages rendered
+			wantRenderIterations: 4, // Stage1 -> Stage2 -> Stage3 -> verify stable
+			wantErr:              false,
+		},
+		"MaxIterationsExceeded": {
+			setupRenderFunc: func() RenderFn {
+				resourceNum := 0
+
+				return func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					// Always produce a new resource - never stabilizes
+					// Key uses crossplane.io/composition-resource-name annotation
+					resourceNum++
+
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{{
+							Unstructured: un.Unstructured{Object: map[string]any{
+								"apiVersion": "example.org/v1",
+								"kind":       "InfiniteResource",
+								"metadata": map[string]any{
+									"name": fmt.Sprintf("resource%d", resourceNum),
+									"annotations": map[string]any{
+										"crossplane.io/composition-resource-name": fmt.Sprintf("res%d", resourceNum),
+									},
+								},
+							}},
+						}},
+					}, nil
+				}
+			},
+			wantComposedCount:    0,
+			wantRenderIterations: 20, // maxIterations
+			wantErr:              true,
+			wantErrContains:      "did not stabilize",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			logger := tu.TestLogger(t, false)
+			renderFunc := tt.setupRenderFunc()
+
+			renderCount := 0
+			countingRenderFunc := func(ctx context.Context, log logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+				renderCount++
+				return renderFunc(ctx, log, in)
+			}
+
+			resourceClient := tu.NewMockResourceClient().Build()
+			environmentClient := tu.NewMockEnvironmentClient().WithNoEnvironmentConfigs().Build()
+
+			requirementsProvider := NewRequirementsProvider(resourceClient, environmentClient, logger)
+
+			baseOpts := testProcessorOptions(t)
+			customOpts := []ProcessorOption{
+				WithLogger(logger),
+				WithRenderFunc(countingRenderFunc),
+				WithRequirementsProviderFactory(func(k8.ResourceClient, xp.EnvironmentClient, logging.Logger) *RequirementsProvider {
+					return requirementsProvider
+				}),
+			}
+			baseOpts = append(baseOpts, customOpts...)
+			processor := NewDiffProcessor(k8.Clients{}, xp.Clients{Definition: tu.NewMockDefinitionClient().Build()}, baseOpts...)
+
+			// Call with synthesizeReady=true
+			output, err := processor.(*DefaultDiffProcessor).RenderToStableState(ctx, xr, composition, functions, "XR/test-xr", nil, true)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error but got none")
+					return
+				}
+
+				if tt.wantErrContains != "" && !strings.Contains(err.Error(), tt.wantErrContains) {
+					t.Errorf("error %q should contain %q", err.Error(), tt.wantErrContains)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+
+			if renderCount != tt.wantRenderIterations {
+				t.Errorf("render called %d times, want %d", renderCount, tt.wantRenderIterations)
+			}
+
+			if len(output.ComposedResources) != tt.wantComposedCount {
+				t.Errorf("got %d composed resources, want %d", len(output.ComposedResources), tt.wantComposedCount)
+			}
+		})
+	}
+}
+
+// hasReadyCondition checks if a resource has a Ready=True condition.
+func hasReadyCondition(res *un.Unstructured) bool {
+	conditions, found, _ := un.NestedSlice(res.Object, "status", "conditions")
+	if !found {
+		return false
+	}
+
+	for _, c := range conditions {
+		cond, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if cond["type"] == "Ready" && cond["status"] == "True" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Helper function to create a test CRD for the given GVK.
+func makeTestCRD(name string, kind string, group string, version string) *extv1.CustomResourceDefinition {
+	return tu.NewCRD(name, group, kind).
+		WithListKind(kind+"List").
+		WithPlural(strings.ToLower(kind)+"s").
+		WithSingular(strings.ToLower(kind)).
+		WithVersion(version, true, true).
+		WithStandardSchema("coolField").
+		Build()
+}
+
+func TestDefaultDiffProcessor_getCompositeResourceXRD(t *testing.T) {
+	ctx := t.Context()
+
+	// Create test XRD for parent resources
+	parentXRD := tu.NewXRD("xparentresources.nested.example.org", "nested.example.org", "XParentResource").
+		WithVersion("v1alpha1", true, true).
+		WithSchema(&extv1.JSONSchemaProps{
+			Type: "object",
+			Properties: map[string]extv1.JSONSchemaProps{
+				"spec": {
+					Type: "object",
+					Properties: map[string]extv1.JSONSchemaProps{
+						"parentField": {Type: "string"},
+					},
+				},
+				"status": {Type: "object"},
+			},
+		}).
+		Build()
+
+	// Create test XRD for child resources
+	childXRD := tu.NewXRD("xchildresources.nested.example.org", "nested.example.org", "XChildResource").
+		WithVersion("v1alpha1", true, true).
+		WithSchema(&extv1.JSONSchemaProps{
+			Type: "object",
+			Properties: map[string]extv1.JSONSchemaProps{
+				"spec": {
+					Type: "object",
+					Properties: map[string]extv1.JSONSchemaProps{
+						"childField": {Type: "string"},
+					},
+				},
+				"status": {Type: "object"},
+			},
+		}).
+		Build()
+
+	tests := map[string]struct {
+		defClient   xp.DefinitionClient
+		resource    *un.Unstructured
+		wantIsXR    bool
+		wantXRDName string
+	}{
+		"ManagedResourceIsNotXR": {
+			defClient: tu.NewMockDefinitionClient().
+				WithXRDForXRNotFound().
+				Build(),
+			resource: tu.NewResource("nop.example.org/v1alpha1", "NopResource", "test-managed").
+				WithSpecField("forProvider", map[string]any{
+					"configData": "test-value",
+				}).
+				Build(),
+			wantIsXR:    false,
+			wantXRDName: "",
+		},
+		"ParentXRCorrectlyIdentified": {
+			defClient: tu.NewMockDefinitionClient().
+				WithXRD(parentXRD).
+				Build(),
+			resource: tu.NewResource("nested.example.org/v1alpha1", "XParentResource", "test-parent").
+				WithSpecField("parentField", "parent-value").
+				Build(),
+			wantIsXR:    true,
+			wantXRDName: "xparentresources.nested.example.org",
+		},
+		"ChildXRCorrectlyIdentified": {
+			defClient: tu.NewMockDefinitionClient().
+				WithXRD(childXRD).
+				Build(),
+			resource: tu.NewResource("nested.example.org/v1alpha1", "XChildResource", "test-child").
+				WithSpecField("childField", "child-value").
+				Build(),
+			wantIsXR:    true,
+			wantXRDName: "xchildresources.nested.example.org",
+		},
+		"ErrorFromDefinitionClientHandled": {
+			defClient: tu.NewMockDefinitionClient().
+				WithXRDForXRError(errors.New("cluster connection error")).
+				Build(),
+			resource: tu.NewResource("nested.example.org/v1alpha1", "XParentResource", "test-parent").
+				WithSpecField("parentField", "parent-value").
+				Build(),
+			wantIsXR:    false,
+			wantXRDName: "",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Create processor with mocked definition client
+			defClient := tt.defClient
+
+			processor := &DefaultDiffProcessor{
+				defClient: defClient,
+				config: ProcessorConfig{
+					Logger: tu.TestLogger(t, false),
+				},
+			}
+
+			// Call the method under test
+			isXR, xrd := processor.getCompositeResourceXRD(ctx, tt.resource)
+
+			// Check isXR result
+			if diff := gcmp.Diff(tt.wantIsXR, isXR); diff != "" {
+				t.Errorf("getCompositeResourceXRD() isXR mismatch (-want +got):\n%s", diff)
+			}
+
+			// Check XRD result
+			var gotXRDName string
+			if xrd != nil {
+				gotXRDName = xrd.GetName()
+			}
+
+			if diff := gcmp.Diff(tt.wantXRDName, gotXRDName); diff != "" {
+				t.Errorf("getCompositeResourceXRD() XRD name mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestDefaultDiffProcessor_ProcessNestedXRs(t *testing.T) {
+	ctx := t.Context()
+
+	// Create test resources
+	childXR := tu.NewResource("nested.example.org/v1alpha1", "XChildResource", "test-parent-child").
+		WithSpecField("childField", "parent-value").
+		WithCompositionResourceName("child-xr").
+		Build()
+
+	managedResource := tu.NewResource("nop.example.org/v1alpha1", "NopResource", "test-managed").
+		WithSpecField("forProvider", map[string]any{
+			"configData": "test-value",
+		}).
+		WithCompositionResourceName("managed-resource").
+		Build()
+
+	childXRD := tu.NewXRD("xchildresources.nested.example.org", "nested.example.org", "XChildResource").
+		WithVersion("v1alpha1", true, true).
+		WithSchema(&extv1.JSONSchemaProps{
+			Type: "object",
+			Properties: map[string]extv1.JSONSchemaProps{
+				"spec": {
+					Type: "object",
+					Properties: map[string]extv1.JSONSchemaProps{
+						"childField": {Type: "string"},
+					},
+				},
+				"status": {Type: "object"},
+			},
+		}).
+		Build()
+
+	childComposition := tu.NewComposition("child-composition").
+		WithCompositeTypeRef("nested.example.org/v1alpha1", "XChildResource").
+		WithPipelineMode().
+		WithPipelineStep("generate-managed", "function-go-templating", map[string]any{
+			"apiVersion": "template.fn.crossplane.io/v1beta1",
+			"kind":       "GoTemplate",
+			"source":     "Inline",
+			"inline": map[string]any{
+				"template": "apiVersion: nop.example.org/v1alpha1\nkind: NopResource\nmetadata:\n  name: test\n  annotations:\n    gotemplating.fn.crossplane.io/composition-resource-name: managed-resource\nspec:\n  forProvider:\n    configData: test",
+			},
+		}).
+		Build()
+
+	tests := map[string]struct {
+		setupMocks        func() (xp.Clients, k8.Clients)
+		composedResources []cpd.Unstructured
+		parentResourceID  string
+		depth             int
+		wantDiffCount     int
+		wantErr           bool
+		wantErrContain    string
+	}{
+		"NoComposedResourcesReturnsEmpty": {
+			setupMocks: func() (xp.Clients, k8.Clients) {
+				xpClients := xp.Clients{
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().Build(),
+				}
+				k8sClients := k8.Clients{}
+
+				return xpClients, k8sClients
+			},
+			composedResources: []cpd.Unstructured{},
+			parentResourceID:  "XParentResource/test-parent",
+			depth:             1,
+			wantDiffCount:     0,
+			wantErr:           false,
+		},
+		"OnlyManagedResourcesReturnsEmpty": {
+			setupMocks: func() (xp.Clients, k8.Clients) {
+				xpClients := xp.Clients{
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRDForXRNotFound().
+						Build(),
+				}
+				k8sClients := k8.Clients{}
+
+				return xpClients, k8sClients
+			},
+			composedResources: []cpd.Unstructured{
+				{Unstructured: *managedResource},
+			},
+			parentResourceID: "XParentResource/test-parent",
+			depth:            1,
+			wantDiffCount:    0,
+			wantErr:          false,
+		},
+		"ChildXRProcessedRecursively": {
+			setupMocks: func() (xp.Clients, k8.Clients) {
+				// Create functions that the composition references
+				functions := []pkgv1.Function{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "function-go-templating",
+						},
+						Spec: pkgv1.FunctionSpec{
+							PackageSpec: pkgv1.PackageSpec{
+								Package: "xpkg.crossplane.io/crossplane-contrib/function-go-templating:v0.11.0",
+							},
+						},
+					},
+				}
+
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithComposition(childComposition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRD(childXRD).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithSuccessfulFunctionsFetch(functions).
+						Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				// Create a child CRD with proper schema for childField
+				childCRD := tu.NewCRD("xchildresources.nested.example.org", "nested.example.org", "XChildResource").
+					WithListKind("XChildResourceList").
+					WithPlural("xchildresources").
+					WithSingular("xchildresource").
+					WithVersion("v1alpha1", true, true).
+					WithStandardSchema("childField").
+					Build()
+
+				// Create a CRD for the managed NopResource that the composition creates
+				nopCRD := tu.NewCRD("nopresources.nop.example.org", "nop.example.org", "NopResource").
+					WithListKind("NopResourceList").
+					WithPlural("nopresources").
+					WithSingular("nopresource").
+					WithVersion("v1alpha1", true, true).
+					WithStandardSchema("configData").
+					Build()
+
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema: tu.NewMockSchemaClient().
+						WithFoundCRD("nested.example.org", "XChildResource", childCRD).
+						WithFoundCRD("nop.example.org", "NopResource", nopCRD).
+						WithSuccessfulCRDByNameFetch("xchildresources.nested.example.org", childCRD).
+						Build(),
+					Type: tu.NewMockTypeConverter().Build(),
+				}
+
+				return xpClients, k8sClients
+			},
+			composedResources: []cpd.Unstructured{
+				{Unstructured: *childXR},
+			},
+			parentResourceID: "XParentResource/test-parent",
+			depth:            1,
+			wantDiffCount:    1, // Should have diff for the child XR itself
+			wantErr:          false,
+		},
+		"MaxDepthExceededReturnsError": {
+			setupMocks: func() (xp.Clients, k8.Clients) {
+				xpClients := xp.Clients{
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRD(childXRD).
+						Build(),
+				}
+				k8sClients := k8.Clients{}
+
+				return xpClients, k8sClients
+			},
+			composedResources: []cpd.Unstructured{
+				{Unstructured: *childXR},
+			},
+			parentResourceID: "XParentResource/test-parent",
+			depth:            11, // Exceeds default maxDepth of 10
+			wantDiffCount:    0,
+			wantErr:          true,
+			wantErrContain:   "maximum nesting depth exceeded",
+		},
+		"MixedXRAndManagedResourcesProcessesOnlyXRs": {
+			setupMocks: func() (xp.Clients, k8.Clients) {
+				// Create functions that the composition references
+				functions := []pkgv1.Function{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "function-go-templating",
+						},
+						Spec: pkgv1.FunctionSpec{
+							PackageSpec: pkgv1.PackageSpec{
+								Package: "xpkg.crossplane.io/crossplane-contrib/function-go-templating:v0.11.0",
+							},
+						},
+					},
+				}
+
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithComposition(childComposition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRD(childXRD).
+						WithXRDForXRNotFoundForGVK(schema.GroupVersionKind{
+							Group:   "nop.example.org",
+							Version: "v1alpha1",
+							Kind:    "NopResource",
+						}).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithSuccessfulFunctionsFetch(functions).
+						Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().Build(),
+				}
+
+				// Create a child CRD with proper schema for childField
+				childCRD := tu.NewCRD("xchildresources.nested.example.org", "nested.example.org", "XChildResource").
+					WithListKind("XChildResourceList").
+					WithPlural("xchildresources").
+					WithSingular("xchildresource").
+					WithVersion("v1alpha1", true, true).
+					WithStandardSchema("childField").
+					Build()
+
+				// Create a CRD for the managed NopResource that the composition creates
+				nopCRD := tu.NewCRD("nopresources.nop.example.org", "nop.example.org", "NopResource").
+					WithListKind("NopResourceList").
+					WithPlural("nopresources").
+					WithSingular("nopresource").
+					WithVersion("v1alpha1", true, true).
+					WithStandardSchema("configData").
+					Build()
+
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema: tu.NewMockSchemaClient().
+						WithFoundCRD("nested.example.org", "XChildResource", childCRD).
+						WithFoundCRD("nop.example.org", "NopResource", nopCRD).
+						WithSuccessfulCRDByNameFetch("xchildresources.nested.example.org", childCRD).
+						Build(),
+					Type: tu.NewMockTypeConverter().Build(),
+				}
+
+				return xpClients, k8sClients
+			},
+			composedResources: []cpd.Unstructured{
+				{Unstructured: *childXR},
+				{Unstructured: *managedResource},
+			},
+			parentResourceID: "XParentResource/test-parent",
+			depth:            1,
+			wantDiffCount:    1, // Only the child XR should be processed
+			wantErr:          false,
+		},
+		"NestedXRWithExistingResourcesPreservesIdentity": {
+			setupMocks: func() (xp.Clients, k8.Clients) {
+				// This test reproduces the bug where existing nested XR identity is not preserved
+				// resulting in all managed resources showing as removed/added instead of modified
+
+				// Create an EXISTING nested XR with actual cluster name (not generateName)
+				existingChildXR := tu.NewResource("nested.example.org/v1alpha1", "XChildResource", "parent-xr-child-abc123").
+					WithGenerateName("parent-xr-").
+					WithSpecField("childField", "existing-value").
+					WithCompositionResourceName("child-xr").
+					WithLabels(map[string]string{
+						"crossplane.io/composite": "parent-xr-abc", // Existing composite label
+					}).
+					Build()
+
+				// Create an existing managed resource owned by the nested XR
+				existingManagedResource := tu.NewResource("nop.example.org/v1alpha1", "NopResource", "parent-xr-child-abc123-managed-xyz").
+					WithGenerateName("parent-xr-child-abc123-").
+					WithSpecField("forProvider", map[string]any{
+						"configData": "existing-data",
+					}).
+					WithCompositionResourceName("managed-resource").
+					WithLabels(map[string]string{
+						"crossplane.io/composite": "parent-xr-child-abc123", // Points to existing nested XR
+					}).
+					Build()
+
+				// Create a parent XR that owns the nested XR
+				parentXR := tu.NewResource("parent.example.org/v1alpha1", "XParentResource", "parent-xr-abc").
+					WithGenerateName("parent-xr-").
+					Build()
+
+				// Create functions
+				functions := []pkgv1.Function{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "function-go-templating",
+						},
+						Spec: pkgv1.FunctionSpec{
+							PackageSpec: pkgv1.PackageSpec{
+								Package: "xpkg.crossplane.io/crossplane-contrib/function-go-templating:v0.11.0",
+							},
+						},
+					},
+				}
+
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithComposition(childComposition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRD(childXRD).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithSuccessfulFunctionsFetch(functions).
+						Build(),
+					// Mock resource tree to return existing nested XR and its managed resources
+					ResourceTree: tu.NewMockResourceTreeClient().
+						WithResourceTreeFromXRAndComposed(
+							parentXR,
+							[]*un.Unstructured{existingChildXR, existingManagedResource},
+						).
+						Build(),
+				}
+
+				// Create CRDs
+				childCRD := tu.NewCRD("xchildresources.nested.example.org", "nested.example.org", "XChildResource").
+					WithListKind("XChildResourceList").
+					WithPlural("xchildresources").
+					WithSingular("xchildresource").
+					WithVersion("v1alpha1", true, true).
+					WithStandardSchema("childField").
+					Build()
+
+				nopCRD := tu.NewCRD("nopresources.nop.example.org", "nop.example.org", "NopResource").
+					WithListKind("NopResourceList").
+					WithPlural("nopresources").
+					WithSingular("nopresource").
+					WithVersion("v1alpha1", true, true).
+					WithStandardSchema("configData").
+					Build()
+
+				k8sClients := k8.Clients{
+					Apply:    tu.NewMockApplyClient().Build(),
+					Resource: tu.NewMockResourceClient().Build(),
+					Schema: tu.NewMockSchemaClient().
+						WithFoundCRD("nested.example.org", "XChildResource", childCRD).
+						WithFoundCRD("nop.example.org", "NopResource", nopCRD).
+						WithSuccessfulCRDByNameFetch("xchildresources.nested.example.org", childCRD).
+						Build(),
+					Type: tu.NewMockTypeConverter().Build(),
+				}
+
+				return xpClients, k8sClients
+			},
+			composedResources: []cpd.Unstructured{
+				// The RENDERED nested XR (from parent composition) with generateName but no name
+				{Unstructured: *childXR},
+			},
+			parentResourceID: "XParentResource/parent-xr-abc",
+			depth:            1,
+			// With identity preservation fix, nested XR maintains its cluster identity
+			// so managed resources show as modified rather than removed/added
+			wantDiffCount: 1, // Just the nested XR diff, not its managed resources as separate remove/add
+			wantErr:       false,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Setup mocks
+			xpClients, k8sClients := tt.setupMocks()
+
+			// Create processor with behavior defaults + custom options
+			baseOpts := testProcessorOptions(t)
+			customOpts := []ProcessorOption{
+				WithSchemaValidatorFactory(func(k8.SchemaClient, xp.DefinitionClient, logging.Logger) SchemaValidator {
+					return &tu.MockSchemaValidator{
+						ValidateResourcesFn: func(context.Context, *un.Unstructured, []cpd.Unstructured) error {
+							return nil
+						},
+					}
+				}),
+				WithDiffCalculatorFactory(func(k8.ApplyClient, xp.ResourceTreeClient, ResourceManager, logging.Logger, renderer.DiffOptions) DiffCalculator {
+					return &tu.MockDiffCalculator{
+						CalculateNonRemovalDiffsFn: func(_ context.Context, xr *cmp.Unstructured, _ *un.Unstructured, _ render.CompositionOutputs) (map[string]*dt.ResourceDiff, map[string]bool, error) {
+							// Return a simple diff for the XR to make the test pass
+							diffs := make(map[string]*dt.ResourceDiff)
+							rendered := make(map[string]bool)
+							gvk := xr.GroupVersionKind()
+							resourceID := gvk.Kind + "/" + xr.GetName()
+							diffs[resourceID] = &dt.ResourceDiff{
+								Gvk:          gvk,
+								ResourceName: xr.GetName(),
+								DiffType:     dt.DiffTypeAdded,
+							}
+							rendered[resourceID] = true
+
+							return diffs, rendered, nil
+						},
+					}
+				}),
+			}
+			baseOpts = append(baseOpts, customOpts...)
+			processor := NewDiffProcessor(k8sClients, xpClients, baseOpts...).(*DefaultDiffProcessor)
+
+			// Initialize if needed
+			if len(tt.composedResources) > 0 {
+				// Mock composition provider that returns a composition
+				compositionProvider := func(ctx context.Context, res *un.Unstructured) (*apiextensionsv1.Composition, error) {
+					return xpClients.Composition.FindMatchingComposition(ctx, res)
+				}
+
+				// Create a mock parent XR (nil is acceptable for tests that don't need observed resources)
+				var parentXR *cmp.Unstructured
+
+				// Call the method under test
+				var observedResources []cpd.Unstructured
+
+				diffs, _, err := processor.ProcessNestedXRs(ctx, tt.composedResources, compositionProvider, tt.parentResourceID, parentXR, observedResources, tt.depth)
+
+				// Check error
+				if (err != nil) != tt.wantErr {
+					t.Errorf("ProcessNestedXRs() error = %v, wantErr %v", err, tt.wantErr)
+					return
+				}
+
+				if tt.wantErr && tt.wantErrContain != "" && !strings.Contains(err.Error(), tt.wantErrContain) {
+					t.Errorf("ProcessNestedXRs() error = %v, want error containing %v", err, tt.wantErrContain)
+					return
+				}
+
+				// Check diff count
+				if diff := gcmp.Diff(tt.wantDiffCount, len(diffs)); diff != "" {
+					t.Errorf("ProcessNestedXRs() diff count mismatch (-want +got):\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+func TestDefaultDiffProcessor_DiffSingleResource_WithObservedResources(t *testing.T) {
+	ctx := t.Context()
+
+	// Create test XR
+	xr := tu.NewResource("example.org/v1", "XR", "test-xr").
+		WithCompositionResourceName("xr-test").
+		Build()
+
+	// Create test observed composed resources
+	observedBucket := tu.NewResource("s3.aws.crossplane.io/v1", "Bucket", "observed-bucket").
+		WithAnnotations(map[string]string{
+			"crossplane.io/composition-resource-name": "bucket",
+		}).
+		WithSpecField("bucketName", "my-bucket").
+		Build()
+
+	observedUser := tu.NewResource("iam.aws.crossplane.io/v1", "User", "observed-user").
+		WithAnnotations(map[string]string{
+			"crossplane.io/composition-resource-name": "user",
+		}).
+		WithSpecField("userName", "my-user").
+		Build()
+
+	// Create a composition with pipeline mode
+	composition := tu.NewComposition("test-composition").
+		WithCompositeTypeRef("example.org/v1", "XR").
+		WithPipelineMode().
+		WithPipelineStep("step1", "function-test", nil).
+		Build()
+
+	// Create test functions
+	functions := []pkgv1.Function{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "function-test",
+			},
+		},
+	}
+
+	tests := map[string]struct {
+		setupMocks           func() (k8.Clients, xp.Clients)
+		wantObservedInRender bool
+		wantObservedCount    int
+		wantErr              bool
+		wantErrContain       string
+		verifyObservedPassed bool
+	}{
+		"ObservedResourcesFetchedAndPassedToRender": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create resource tree with observed composed resources
+				resourceTree := &resource.Resource{
+					Unstructured: *xr,
+					Children: []*resource.Resource{
+						{Unstructured: *observedBucket},
+						{Unstructured: *observedUser},
+					},
+				}
+
+				// Create XRD
+				xrdUnstructured := tu.NewXRD("xrs.example.org", "example.org", "XR").
+					WithPlural("xrs").
+					WithSingular("xr").
+					WithVersion("v1", true, true).
+					WithSchema(&extv1.JSONSchemaProps{
+						Type: "object",
+						Properties: map[string]extv1.JSONSchemaProps{
+							"spec":   {Type: "object"},
+							"status": {Type: "object"},
+						},
+					}).
+					BuildAsUnstructured()
+
+				// Create CRDs
+				xrCRD := tu.NewCRD("xrs.example.org", "example.org", "XR").
+					WithListKind("XRList").
+					WithPlural("xrs").
+					WithSingular("xr").
+					WithVersion("v1", true, true).
+					WithStandardSchema("field").
+					Build()
+
+				bucketCRD := tu.NewCRD("buckets.s3.aws.crossplane.io", "s3.aws.crossplane.io", "Bucket").
+					WithListKind("BucketList").
+					WithPlural("buckets").
+					WithSingular("bucket").
+					WithVersion("v1", true, true).
+					WithStandardSchema("bucketName").
+					Build()
+
+				userCRD := tu.NewCRD("users.iam.aws.crossplane.io", "iam.aws.crossplane.io", "User").
+					WithListKind("UserList").
+					WithPlural("users").
+					WithSingular("user").
+					WithVersion("v1", true, true).
+					WithStandardSchema("userName").
+					Build()
+
+				k8sClients := k8.Clients{
+					Apply: tu.NewMockApplyClient().
+						WithSuccessfulDryRun().
+						Build(),
+					Resource: tu.NewMockResourceClient().
+						WithResourcesExist(xr).
+						Build(),
+					Schema: tu.NewMockSchemaClient().
+						WithNoResourcesRequiringCRDs().
+						WithGetCRD(func(_ context.Context, gvk schema.GroupVersionKind) (*extv1.CustomResourceDefinition, error) {
+							switch {
+							case gvk.Group == "example.org" && gvk.Kind == "XR":
+								return xrCRD, nil
+							case gvk.Group == "s3.aws.crossplane.io" && gvk.Kind == "Bucket":
+								return bucketCRD, nil
+							case gvk.Group == "iam.aws.crossplane.io" && gvk.Kind == "User":
+								return userCRD, nil
+							default:
+								return nil, errors.Errorf("CRD not found for %v", gvk)
+							}
+						}).
+						WithSuccessfulCRDByNameFetch("xrs.example.org", xrCRD).
+						Build(),
+					Type: tu.NewMockTypeConverter().Build(),
+				}
+
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithSuccessfulCompositionMatch(composition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRDForXR(xrdUnstructured).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithSuccessfulFunctionsFetch(functions).
+						Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().
+						WithGetResourceTree(func(_ context.Context, _ *un.Unstructured) (*resource.Resource, error) {
+							return resourceTree, nil
+						}).
+						Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			wantObservedInRender: true,
+			wantObservedCount:    2,
+			verifyObservedPassed: true,
+			wantErr:              false,
+		},
+		"EmptyObservedResourcesWhenTreeEmpty": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create empty resource tree
+				emptyTree := &resource.Resource{
+					Unstructured: *xr,
+					Children:     []*resource.Resource{},
+				}
+
+				// Create XRD
+				xrdUnstructured := tu.NewXRD("xrs.example.org", "example.org", "XR").
+					WithPlural("xrs").
+					WithSingular("xr").
+					WithVersion("v1", true, true).
+					WithSchema(&extv1.JSONSchemaProps{
+						Type: "object",
+						Properties: map[string]extv1.JSONSchemaProps{
+							"spec":   {Type: "object"},
+							"status": {Type: "object"},
+						},
+					}).
+					BuildAsUnstructured()
+
+				// Create CRD
+				xrCRD := tu.NewCRD("xrs.example.org", "example.org", "XR").
+					WithListKind("XRList").
+					WithPlural("xrs").
+					WithSingular("xr").
+					WithVersion("v1", true, true).
+					WithStandardSchema("field").
+					Build()
+
+				k8sClients := k8.Clients{
+					Apply: tu.NewMockApplyClient().
+						WithSuccessfulDryRun().
+						Build(),
+					Resource: tu.NewMockResourceClient().
+						WithResourcesExist(xr).
+						Build(),
+					Schema: tu.NewMockSchemaClient().
+						WithNoResourcesRequiringCRDs().
+						WithGetCRD(func(_ context.Context, gvk schema.GroupVersionKind) (*extv1.CustomResourceDefinition, error) {
+							if gvk.Group == "example.org" && gvk.Kind == "XR" {
+								return xrCRD, nil
+							}
+
+							return nil, errors.Errorf("CRD not found for %v", gvk)
+						}).
+						WithSuccessfulCRDByNameFetch("xrs.example.org", xrCRD).
+						Build(),
+					Type: tu.NewMockTypeConverter().Build(),
+				}
+
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithSuccessfulCompositionMatch(composition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRDForXR(xrdUnstructured).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithSuccessfulFunctionsFetch(functions).
+						Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().
+						WithGetResourceTree(func(_ context.Context, _ *un.Unstructured) (*resource.Resource, error) {
+							return emptyTree, nil
+						}).
+						Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			wantObservedInRender: true,
+			wantObservedCount:    0,
+			verifyObservedPassed: true,
+			wantErr:              false,
+		},
+		"ContinuesWhenFetchObservedResourcesFails": {
+			setupMocks: func() (k8.Clients, xp.Clients) {
+				// Create XRD
+				xrdUnstructured := tu.NewXRD("xrs.example.org", "example.org", "XR").
+					WithPlural("xrs").
+					WithSingular("xr").
+					WithVersion("v1", true, true).
+					WithSchema(&extv1.JSONSchemaProps{
+						Type: "object",
+						Properties: map[string]extv1.JSONSchemaProps{
+							"spec":   {Type: "object"},
+							"status": {Type: "object"},
+						},
+					}).
+					BuildAsUnstructured()
+
+				// Create CRD
+				xrCRD := tu.NewCRD("xrs.example.org", "example.org", "XR").
+					WithListKind("XRList").
+					WithPlural("xrs").
+					WithSingular("xr").
+					WithVersion("v1", true, true).
+					WithStandardSchema("field").
+					Build()
+
+				k8sClients := k8.Clients{
+					Apply: tu.NewMockApplyClient().
+						WithSuccessfulDryRun().
+						Build(),
+					Resource: tu.NewMockResourceClient().
+						WithResourcesExist(xr).
+						Build(),
+					Schema: tu.NewMockSchemaClient().
+						WithNoResourcesRequiringCRDs().
+						WithGetCRD(func(_ context.Context, gvk schema.GroupVersionKind) (*extv1.CustomResourceDefinition, error) {
+							if gvk.Group == "example.org" && gvk.Kind == "XR" {
+								return xrCRD, nil
+							}
+
+							return nil, errors.Errorf("CRD not found for %v", gvk)
+						}).
+						WithSuccessfulCRDByNameFetch("xrs.example.org", xrCRD).
+						Build(),
+					Type: tu.NewMockTypeConverter().Build(),
+				}
+
+				xpClients := xp.Clients{
+					Composition: tu.NewMockCompositionClient().
+						WithSuccessfulCompositionMatch(composition).
+						Build(),
+					Credential: &tu.MockCredentialClient{},
+					Definition: tu.NewMockDefinitionClient().
+						WithXRDForXR(xrdUnstructured).
+						Build(),
+					Environment: tu.NewMockEnvironmentClient().
+						WithNoEnvironmentConfigs().
+						Build(),
+					Function: tu.NewMockFunctionClient().
+						WithSuccessfulFunctionsFetch(functions).
+						Build(),
+					ResourceTree: tu.NewMockResourceTreeClient().
+						WithGetResourceTree(func(_ context.Context, _ *un.Unstructured) (*resource.Resource, error) {
+							return nil, errors.New("failed to get resource tree")
+						}).
+						Build(),
+				}
+
+				return k8sClients, xpClients
+			},
+			wantObservedInRender: true,
+			wantObservedCount:    0, // Should pass empty list when fetch fails
+			verifyObservedPassed: true,
+			wantErr:              true,                       // Should return partial error so user knows removal detection failed
+			wantErrContain:       "cannot get resource tree", // The resource tree error is now surfaced
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			k8sClients, xpClients := tt.setupMocks()
+
+			// Track whether observed resources were passed to render
+			var (
+				capturedObservedCount int
+				capturedObserved      []cpd.Unstructured
+			)
+
+			// Create processor with custom render function that captures observed resources
+			baseOpts := testProcessorOptions(t)
+			customOpts := []ProcessorOption{
+				WithRenderFunc(func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+					capturedObserved = in.ObservedResources
+					capturedObservedCount = len(in.ObservedResources)
+
+					return render.CompositionOutputs{
+						CompositeResource: in.CompositeResource,
+						ComposedResources: []cpd.Unstructured{},
+					}, nil
+				}),
+				WithSchemaValidatorFactory(func(k8.SchemaClient, xp.DefinitionClient, logging.Logger) SchemaValidator {
+					return &tu.MockSchemaValidator{
+						ValidateResourcesFn: func(context.Context, *un.Unstructured, []cpd.Unstructured) error {
+							return nil
+						},
+					}
+				}),
+				WithDiffCalculatorFactory(NewDiffCalculator),
+			}
+			baseOpts = append(baseOpts, customOpts...)
+			processor := NewDiffProcessor(k8sClients, xpClients, baseOpts...)
+
+			// Initialize processor
+			err := processor.Initialize(ctx)
+			if err != nil {
+				t.Fatalf("Failed to initialize processor: %v", err)
+			}
+
+			// Call DiffSingleResource
+			compositionProvider := func(ctx context.Context, res *un.Unstructured) (*apiextensionsv1.Composition, error) {
+				return xpClients.Composition.FindMatchingComposition(ctx, res)
+			}
+
+			diffs, err := processor.(*DefaultDiffProcessor).DiffSingleResource(ctx, xr, compositionProvider)
+
+			// Check error expectations
+			if (err != nil) != tt.wantErr {
+				t.Errorf("DiffSingleResource() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if tt.wantErr && tt.wantErrContain != "" && !strings.Contains(err.Error(), tt.wantErrContain) {
+				t.Errorf("DiffSingleResource() error = %v, want error containing %v", err, tt.wantErrContain)
+				return
+			}
+
+			if err != nil {
+				return
+			}
+
+			// Verify observed resources were passed to render if expected
+			if tt.verifyObservedPassed {
+				if capturedObservedCount != tt.wantObservedCount {
+					t.Errorf("DiffSingleResource() passed %d observed resources to render, want %d",
+						capturedObservedCount, tt.wantObservedCount)
+				}
+
+				// If we expected observed resources, verify they have the composition annotation
+				if tt.wantObservedCount > 0 {
+					for i, obs := range capturedObserved {
+						if _, hasAnno := obs.GetAnnotations()["crossplane.io/composition-resource-name"]; !hasAnno {
+							t.Errorf("Observed resource %d missing composition-resource-name annotation", i)
+						}
+					}
+				}
+			}
+
+			// Verify diffs were returned (even if empty)
+			if diffs == nil {
+				t.Errorf("DiffSingleResource() returned nil diffs, expected non-nil map")
+			}
+		})
+	}
+}
+
+func TestDefaultDiffProcessor_synthesizeDummyBackingXRForNewClaim(t *testing.T) {
+	ctx := t.Context()
+
+	// Create test XRD as unstructured (simpler than using typed builder for this test)
+	xrdObj := &un.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "apiextensions.crossplane.io/v1",
+			"kind":       "CompositeResourceDefinition",
+			"metadata": map[string]any{
+				"name": "xnopresources.example.org",
+			},
+			"spec": map[string]any{
+				"group": "example.org",
+				"names": map[string]any{
+					"kind":   "XNopResource",
+					"plural": "xnopresources",
+				},
+				"claimNames": map[string]any{
+					"kind":   "NopClaim",
+					"plural": "nopclaims",
+				},
+			},
+		},
+	}
+
+	tests := map[string]struct {
+		defClient      func() *tu.MockDefinitionClient
+		claim          *un.Unstructured
+		wantResult     bool // whether we expect a non-empty result
+		wantXRKind     string
+		wantXRName     string
+		wantClaimRef   bool
+		wantSpecCopied bool
+		wantErr        bool
+	}{
+		"NotAClaim_ReturnsEmptyResult": {
+			defClient: func() *tu.MockDefinitionClient {
+				return tu.NewMockDefinitionClient().
+					WithIsClaimResource(func(_ context.Context, _ *un.Unstructured) bool {
+						return false
+					}).
+					Build()
+			},
+			claim: tu.NewResource("example.org/v1alpha1", "XNopResource", "test-xr").
+				WithSpecField("coolField", "test-value").
+				Build(),
+			wantResult: false,
+			wantErr:    false,
+		},
+		"ClaimWithValidXRD_SynthesizesBackingXR": {
+			defClient: func() *tu.MockDefinitionClient {
+				return tu.NewMockDefinitionClient().
+					WithIsClaimResource(func(_ context.Context, _ *un.Unstructured) bool {
+						return true
+					}).
+					WithXRDForClaim(xrdObj).
+					Build()
+			},
+			claim: tu.NewResource("example.org/v1alpha1", "NopClaim", "test-claim").
+				WithNamespace("test-namespace").
+				WithSpecField("coolField", "test-value").
+				Build(),
+			wantResult:     true,
+			wantXRKind:     "XNopResource",
+			wantXRName:     "test-claim",
+			wantClaimRef:   true,
+			wantSpecCopied: true,
+			wantErr:        false,
+		},
+		"ClaimWithXRDError_ReturnsError": {
+			defClient: func() *tu.MockDefinitionClient {
+				return tu.NewMockDefinitionClient().
+					WithIsClaimResource(func(_ context.Context, _ *un.Unstructured) bool {
+						return true
+					}).
+					WithGetXRDForClaim(func(_ context.Context, _ schema.GroupVersionKind) (*un.Unstructured, error) {
+						return nil, errors.New("XRD not found")
+					}).
+					Build()
+			},
+			claim: tu.NewResource("example.org/v1alpha1", "NopClaim", "test-claim").
+				WithNamespace("test-namespace").
+				Build(),
+			wantResult: false,
+			wantErr:    true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			processor := &DefaultDiffProcessor{
+				defClient: tt.defClient(),
+				config: ProcessorConfig{
+					Logger: tu.TestLogger(t, false),
+				},
+			}
+
+			// Convert claim to composite.Unstructured
+			claim := cmp.New()
+			claim.SetUnstructuredContent(tt.claim.Object)
+
+			result, err := processor.synthesizeDummyBackingXRForNewClaim(ctx, claim)
+
+			// Check error expectation
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("synthesizeDummyBackingXRForNewClaim() expected error, got nil")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Errorf("synthesizeDummyBackingXRForNewClaim() unexpected error: %v", err)
+				return
+			}
+
+			// Check if result is empty or not
+			hasResult := result.xrForRendering != nil
+			if diff := gcmp.Diff(tt.wantResult, hasResult); diff != "" {
+				t.Errorf("synthesizeDummyBackingXRForNewClaim() hasResult mismatch (-want +got):\n%s", diff)
+				return
+			}
+
+			if !tt.wantResult {
+				return // No further checks needed for empty result
+			}
+
+			// Verify XR kind
+			if diff := gcmp.Diff(tt.wantXRKind, result.kind); diff != "" {
+				t.Errorf("synthesizeDummyBackingXRForNewClaim() kind mismatch (-want +got):\n%s", diff)
+			}
+
+			// Verify XR name
+			if diff := gcmp.Diff(tt.wantXRName, result.name); diff != "" {
+				t.Errorf("synthesizeDummyBackingXRForNewClaim() name mismatch (-want +got):\n%s", diff)
+			}
+
+			// Verify claimRef is set
+			if tt.wantClaimRef {
+				claimRef, found, _ := un.NestedMap(result.xrForRendering.Object, "spec", "claimRef")
+				if !found {
+					t.Errorf("synthesizeDummyBackingXRForNewClaim() claimRef not found in result")
+				} else {
+					// Build expected claimRef for comparison
+					wantClaimRef := map[string]any{
+						"name":       tt.claim.GetName(),
+						"namespace":  tt.claim.GetNamespace(),
+						"kind":       tt.claim.GetKind(),
+						"apiVersion": tt.claim.GetAPIVersion(),
+					}
+
+					if diff := gcmp.Diff(wantClaimRef, claimRef); diff != "" {
+						t.Errorf("synthesizeDummyBackingXRForNewClaim() claimRef mismatch (-want +got):\n%s", diff)
+					}
+				}
+			}
+
+			// Verify spec fields are copied
+			if tt.wantSpecCopied {
+				coolField, found, _ := un.NestedString(result.xrForRendering.Object, "spec", "coolField")
+				if !found {
+					t.Errorf("synthesizeDummyBackingXRForNewClaim() spec.coolField not found")
+				}
+
+				if diff := gcmp.Diff("test-value", coolField); diff != "" {
+					t.Errorf("synthesizeDummyBackingXRForNewClaim() spec.coolField mismatch (-want +got):\n%s", diff)
+				}
+			}
+
+			// Verify UID is set
+			if result.xrForRendering.GetUID() == "" {
+				t.Errorf("synthesizeDummyBackingXRForNewClaim() UID not set on result")
+			}
+		})
+	}
+}
+
+// TestDefaultDiffProcessor_resolveBackingXRForClaim_SpecMerge tests the spec merge logic
+// for existing claims, ensuring that deprecated fields from the backing XR are not
+// preserved when the user has removed them from the Claim spec.
+func TestDefaultDiffProcessor_resolveBackingXRForClaim_SpecMerge(t *testing.T) {
+	ctx := t.Context()
+
+	tests := map[string]struct {
+		claimSpec          map[string]any // User's updated claim spec
+		backingXRSpec      map[string]any // Existing backing XR spec with deprecated fields
+		expectedMergedSpec map[string]any // Expected spec after merge
+		description        string
+	}{
+		"RemoveDeprecatedField": {
+			claimSpec: map[string]any{
+				"newField": "new-value",
+			},
+			backingXRSpec: map[string]any{
+				"newField":        "new-value",
+				"deprecatedField": "should-be-removed",
+				"claimRef": map[string]any{
+					"name":       "test-claim",
+					"namespace":  "default",
+					"kind":       "TestClaim",
+					"apiVersion": "example.org/v1",
+				},
+			},
+			expectedMergedSpec: map[string]any{
+				"newField": "new-value",
+				"claimRef": map[string]any{
+					"name":       "test-claim",
+					"namespace":  "default",
+					"kind":       "TestClaim",
+					"apiVersion": "example.org/v1",
+				},
+				// deprecatedField should NOT be present in merged spec
+			},
+			description: "User removed deprecatedField from Claim - it should not reappear in merged spec",
+		},
+		"PreserveCrossplaneFields": {
+			claimSpec: map[string]any{
+				"field1": "value1",
+				"field2": "value2",
+			},
+			backingXRSpec: map[string]any{
+				"field1": "value1",
+				"field2": "value2",
+				"claimRef": map[string]any{
+					"name":       "test-claim",
+					"namespace":  "ns",
+					"kind":       "TestClaim",
+					"apiVersion": "example.org/v1",
+				},
+			},
+			expectedMergedSpec: map[string]any{
+				"field1": "value1",
+				"field2": "value2",
+				"claimRef": map[string]any{
+					"name":       "test-claim",
+					"namespace":  "ns",
+					"kind":       "TestClaim",
+					"apiVersion": "example.org/v1",
+				},
+			},
+			description: "claimRef should be preserved in merged spec",
+		},
+		"RemoveMultipleDeprecatedFields": {
+			claimSpec: map[string]any{
+				"activeField": "active",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "active",
+				"deprecated1": "old1",
+				"deprecated2": "old2",
+				"deprecated3": "old3",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+			},
+			expectedMergedSpec: map[string]any{
+				"activeField": "active",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				// All deprecated fields should be gone
+			},
+			description: "Multiple deprecated fields should all be removed",
+		},
+		"PreserveResourceRefsFromBackingXR": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"resourceRefs": []any{
+					map[string]any{"name": "resource-1", "kind": "NopResource"},
+					map[string]any{"name": "resource-2", "kind": "NopResource"},
+				},
+			},
+			expectedMergedSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"resourceRefs": []any{
+					map[string]any{"name": "resource-1", "kind": "NopResource"},
+					map[string]any{"name": "resource-2", "kind": "NopResource"},
+				},
+			},
+			description: "resourceRefs should always be preserved from backing XR (XR-only field)",
+		},
+		"PreserveCompositionRefIfNotInClaim": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRef": map[string]any{
+					"name": "my-composition",
+				},
+			},
+			expectedMergedSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRef": map[string]any{
+					"name": "my-composition",
+				},
+			},
+			description: "compositionRef should be preserved from backing XR if not provided in Claim",
+		},
+		"ClaimOverridesCompositionRef": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+				"compositionRef": map[string]any{
+					"name": "new-composition",
+				},
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRef": map[string]any{
+					"name": "old-composition",
+				},
+			},
+			expectedMergedSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRef": map[string]any{
+					"name": "new-composition",
+				},
+			},
+			description: "Claim-provided compositionRef should override backing XR value",
+		},
+		"PreserveCompositionSelectorIfNotInClaim": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionSelector": map[string]any{
+					"matchLabels": map[string]any{
+						"env": "production",
+					},
+				},
+			},
+			expectedMergedSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionSelector": map[string]any{
+					"matchLabels": map[string]any{
+						"env": "production",
+					},
+				},
+			},
+			description: "compositionSelector should be preserved from backing XR if not provided in Claim",
+		},
+		"PreserveWriteConnectionSecretToRefIfNotInClaim": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"writeConnectionSecretToRef": map[string]any{
+					"name":      "my-secret",
+					"namespace": "default",
+				},
+			},
+			expectedMergedSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"writeConnectionSecretToRef": map[string]any{
+					"name":      "my-secret",
+					"namespace": "default",
+				},
+			},
+			description: "writeConnectionSecretToRef should be preserved from backing XR if not provided in Claim",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Create the existing claim as it would be fetched from cluster
+			// This claim has resourceRef pointing to the backing XR
+			existingClaimFromCluster := tu.NewResource("example.org/v1", "TestClaim", "test-claim").
+				InNamespace("default").
+				Build()
+			// Set resourceRef to point to the backing XR
+			if err := un.SetNestedField(existingClaimFromCluster.Object, map[string]any{
+				"name":       "test-claim-abc123",
+				"apiVersion": "example.org/v1",
+				"kind":       "XTest",
+			}, "spec", "resourceRef"); err != nil {
+				t.Fatalf("Failed to set resourceRef: %v", err)
+			}
+
+			// Create backing XR with spec containing deprecated fields
+			backingXR := tu.NewResource("example.org/v1", "XTest", "test-claim-abc123").
+				InNamespace("default").
+				Build()
+			if err := un.SetNestedField(backingXR.Object, tt.backingXRSpec, "spec"); err != nil {
+				t.Fatalf("Failed to set backing XR spec: %v", err)
+			}
+
+			// Create the updated claim (what the user is trying to apply)
+			updatedClaim := tu.NewResource("example.org/v1", "TestClaim", "test-claim").
+				InNamespace("default").
+				Build()
+			if err := un.SetNestedField(updatedClaim.Object, tt.claimSpec, "spec"); err != nil {
+				t.Fatalf("Failed to set updated claim spec: %v", err)
+			}
+
+			// Create mock clients
+			defClient := tu.NewMockDefinitionClient().
+				WithIsClaimResource(func(_ context.Context, _ *un.Unstructured) bool {
+					return true
+				}).
+				Build()
+
+			// Create mock resource manager that returns the backing XR
+			resourceManager := &mockResourceManagerForSpecMerge{
+				backingXR: backingXR,
+			}
+
+			processor := &DefaultDiffProcessor{
+				defClient:       defClient,
+				resourceManager: resourceManager,
+				config: ProcessorConfig{
+					Logger: tu.TestLogger(t, false),
+				},
+			}
+
+			// Convert updated claim to composite.Unstructured
+			updatedClaimCmp := cmp.New()
+			updatedClaimCmp.SetUnstructuredContent(updatedClaim.Object)
+
+			// Call resolveBackingXRForClaim with:
+			// - existingClaimFromCluster: the existing claim (has resourceRef to backing XR)
+			// - updatedClaimCmp: the updated claim spec from user
+			result, err := processor.resolveBackingXRForClaim(ctx, existingClaimFromCluster, updatedClaimCmp)
+			if err != nil {
+				t.Fatalf("resolveBackingXRForClaim() unexpected error: %v", err)
+			}
+
+			if result.xrForRendering == nil {
+				t.Fatalf("resolveBackingXRForClaim() returned nil xrForRendering")
+			}
+
+			// Extract the merged spec from xrForRendering
+			gotSpec, _, err := un.NestedFieldCopy(result.xrForRendering.Object, "spec")
+			if err != nil {
+				t.Fatalf("Failed to extract spec from result: %v", err)
+			}
+
+			// Convert to map for comparison
+			gotSpecMap, ok := gotSpec.(map[string]any)
+			if !ok {
+				t.Fatalf("spec is not a map: %T", gotSpec)
+			}
+
+			// Verify the merged spec matches expected
+			if diff := gcmp.Diff(tt.expectedMergedSpec, gotSpecMap); diff != "" {
+				t.Errorf("resolveBackingXRForClaim() merged spec mismatch (-want +got):\n%s\nTest: %s", diff, tt.description)
+			}
+
+			// Verify deprecated fields are NOT in the result
+			if claimSpecLen := len(tt.claimSpec); claimSpecLen > 0 {
+				for _, field := range []string{"deprecated1", "deprecated2", "deprecated3", "deprecatedField"} {
+					if _, found, _ := un.NestedFieldCopy(result.xrForRendering.Object, "spec", field); found {
+						t.Errorf("resolveBackingXRForClaim() deprecated field %q should not be in merged spec", field)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultDiffProcessor_resolveBackingXRForClaim_CompositionRevisionRef tests the compositionRevisionRef
+// preservation logic based on the compositionUpdatePolicy field.
+func TestDefaultDiffProcessor_resolveBackingXRForClaim_CompositionRevisionRef(t *testing.T) {
+	ctx := t.Context()
+
+	tests := map[string]struct {
+		claimSpec                  map[string]any
+		backingXRSpec              map[string]any
+		compositionUpdatePolicy    string // "Automatic" or "Manual"
+		compositionUpdatePolicyV2  bool   // true to use v2 path (spec.crossplane.compositionUpdatePolicy)
+		expectRevisionRefPreserved bool
+		description                string
+	}{
+		"PreserveCompositionRevisionRefWithManualPolicy": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRevisionRef": map[string]any{
+					"name": "my-composition-rev-1",
+				},
+			},
+			compositionUpdatePolicy:    "Manual",
+			compositionUpdatePolicyV2:  false, // v1 path
+			expectRevisionRefPreserved: true,
+			description:                "compositionRevisionRef should be preserved when update policy is Manual (v1 path)",
+		},
+		"PreserveCompositionRevisionRefWithManualPolicyV2": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRevisionRef": map[string]any{
+					"name": "my-composition-rev-1",
+				},
+			},
+			compositionUpdatePolicy:    "Manual",
+			compositionUpdatePolicyV2:  true, // v2 path
+			expectRevisionRefPreserved: true,
+			description:                "compositionRevisionRef should be preserved when update policy is Manual (v2 path)",
+		},
+		"DoNotPreserveCompositionRevisionRefWithAutomaticPolicy": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRevisionRef": map[string]any{
+					"name": "my-composition-rev-1",
+				},
+			},
+			compositionUpdatePolicy:    "Automatic",
+			compositionUpdatePolicyV2:  false,
+			expectRevisionRefPreserved: false,
+			description:                "compositionRevisionRef should NOT be preserved when update policy is Automatic",
+		},
+		"DoNotPreserveCompositionRevisionRefWithDefaultPolicy": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRevisionRef": map[string]any{
+					"name": "my-composition-rev-1",
+				},
+			},
+			compositionUpdatePolicy:    "", // Empty means default (Automatic)
+			expectRevisionRefPreserved: false,
+			description:                "compositionRevisionRef should NOT be preserved when update policy defaults to Automatic",
+		},
+		"ClaimCanOverrideCompositionRevisionRef": {
+			claimSpec: map[string]any{
+				"activeField": "value",
+				"compositionRevisionRef": map[string]any{
+					"name": "my-composition-rev-2",
+				},
+			},
+			backingXRSpec: map[string]any{
+				"activeField": "value",
+				"claimRef": map[string]any{
+					"name": "claim",
+				},
+				"compositionRevisionRef": map[string]any{
+					"name": "my-composition-rev-1",
+				},
+			},
+			compositionUpdatePolicy:    "Manual",
+			expectRevisionRefPreserved: true, // But from Claim, not backing XR
+			description:                "Claim can override compositionRevisionRef even with Manual policy",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Create the existing claim as it would be fetched from cluster
+			// This claim has resourceRef pointing to the backing XR
+			existingClaimFromCluster := tu.NewResource("example.org/v1", "TestClaim", "test-claim").
+				InNamespace("default").
+				Build()
+			// Set resourceRef to point to the backing XR
+			if err := un.SetNestedField(existingClaimFromCluster.Object, map[string]any{
+				"name":       "test-claim-abc123",
+				"apiVersion": "example.org/v1",
+				"kind":       "XTest",
+			}, "spec", "resourceRef"); err != nil {
+				t.Fatalf("Failed to set resourceRef: %v", err)
+			}
+
+			// Create backing XR with spec
+			backingXR := tu.NewResource("example.org/v1", "XTest", "test-claim-abc123").
+				InNamespace("default").
+				Build()
+			if err := un.SetNestedField(backingXR.Object, tt.backingXRSpec, "spec"); err != nil {
+				t.Fatalf("Failed to set backing XR spec: %v", err)
+			}
+
+			// Set compositionUpdatePolicy on backing XR
+			if tt.compositionUpdatePolicy != "" {
+				var policyPath []string
+				if tt.compositionUpdatePolicyV2 {
+					policyPath = []string{"spec", "crossplane", "compositionUpdatePolicy"}
+				} else {
+					policyPath = []string{"spec", "compositionUpdatePolicy"}
+				}
+
+				if err := un.SetNestedField(backingXR.Object, tt.compositionUpdatePolicy, policyPath...); err != nil {
+					t.Fatalf("Failed to set compositionUpdatePolicy: %v", err)
+				}
+			}
+
+			// Create the updated claim (what the user is trying to apply)
+			updatedClaim := tu.NewResource("example.org/v1", "TestClaim", "test-claim").
+				InNamespace("default").
+				Build()
+			if err := un.SetNestedField(updatedClaim.Object, tt.claimSpec, "spec"); err != nil {
+				t.Fatalf("Failed to set updated claim spec: %v", err)
+			}
+
+			// Create mock clients
+			defClient := tu.NewMockDefinitionClient().
+				WithIsClaimResource(func(_ context.Context, _ *un.Unstructured) bool {
+					return true
+				}).
+				Build()
+
+			// Create mock resource manager that returns the backing XR
+			resourceManager := &mockResourceManagerForSpecMerge{
+				backingXR: backingXR,
+			}
+
+			processor := &DefaultDiffProcessor{
+				defClient:       defClient,
+				resourceManager: resourceManager,
+				config: ProcessorConfig{
+					Logger: tu.TestLogger(t, false),
+				},
+			}
+
+			// Convert updated claim to composite.Unstructured
+			updatedClaimCmp := cmp.New()
+			updatedClaimCmp.SetUnstructuredContent(updatedClaim.Object)
+
+			// Call resolveBackingXRForClaim with:
+			// - existingClaimFromCluster: the existing claim (has resourceRef to backing XR)
+			// - updatedClaimCmp: the updated claim spec from user
+			result, err := processor.resolveBackingXRForClaim(ctx, existingClaimFromCluster, updatedClaimCmp)
+			if err != nil {
+				t.Fatalf("resolveBackingXRForClaim() unexpected error: %v", err)
+			}
+
+			if result.xrForRendering == nil {
+				t.Fatalf("resolveBackingXRForClaim() returned nil xrForRendering")
+			}
+
+			// Check if compositionRevisionRef is in the merged spec
+			_, found, _ := un.NestedFieldCopy(result.xrForRendering.Object, "spec", "compositionRevisionRef")
+
+			if tt.expectRevisionRefPreserved && !found {
+				t.Errorf("resolveBackingXRForClaim() compositionRevisionRef should be preserved but was not. Test: %s", tt.description)
+			}
+
+			if !tt.expectRevisionRefPreserved && found {
+				t.Errorf("resolveBackingXRForClaim() compositionRevisionRef should NOT be preserved but was. Test: %s", tt.description)
+			}
+
+			// Special case: verify Claim value takes precedence when Claim provides compositionRevisionRef
+			if claimRevRef, hasClaimRef := tt.claimSpec["compositionRevisionRef"]; hasClaimRef && found {
+				gotRevRef, _, _ := un.NestedFieldCopy(result.xrForRendering.Object, "spec", "compositionRevisionRef")
+				if diff := gcmp.Diff(claimRevRef, gotRevRef); diff != "" {
+					t.Errorf("resolveBackingXRForClaim() compositionRevisionRef should match Claim value (-want +got):\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+func TestMergeCredentials(t *testing.T) {
+	// Define common test secrets
+	var secret1NS1 corev1.Secret
+	tu.NewResource("v1", "Secret", "secret1").InNamespace("ns1").BuildTyped(&secret1NS1)
+
+	var secret2NS2 corev1.Secret
+	tu.NewResource("v1", "Secret", "secret2").InNamespace("ns2").BuildTyped(&secret2NS2)
+
+	var secret1CLIValue corev1.Secret
+	tu.NewResource("v1", "Secret", "secret1").InNamespace("ns1").
+		WithData(map[string][]byte{"key": []byte("cli-value")}).
+		BuildTyped(&secret1CLIValue)
+
+	var secret1AutoValue corev1.Secret
+	tu.NewResource("v1", "Secret", "secret1").InNamespace("ns1").
+		WithData(map[string][]byte{"key": []byte("auto-value")}).
+		BuildTyped(&secret1AutoValue)
+
+	var cliSecretNS1 corev1.Secret
+	tu.NewResource("v1", "Secret", "cli-secret").InNamespace("ns1").BuildTyped(&cliSecretNS1)
+
+	var autoSecretNS2 corev1.Secret
+	tu.NewResource("v1", "Secret", "auto-secret").InNamespace("ns2").BuildTyped(&autoSecretNS2)
+
+	var secret1First corev1.Secret
+	tu.NewResource("v1", "Secret", "secret1").InNamespace("ns1").
+		WithData(map[string][]byte{"key": []byte("first")}).
+		BuildTyped(&secret1First)
+
+	var secret1Second corev1.Secret
+	tu.NewResource("v1", "Secret", "secret1").InNamespace("ns1").
+		WithData(map[string][]byte{"key": []byte("second")}).
+		BuildTyped(&secret1Second)
+
+	tests := map[string]struct {
+		cliCredentials         []corev1.Secret
+		autoFetchedCredentials []corev1.Secret
+		want                   map[string]bool // expected namespace/name keys in result
+		wantCount              int
+	}{
+		"EmptyBoth": {
+			cliCredentials:         nil,
+			autoFetchedCredentials: nil,
+			want:                   map[string]bool{},
+			wantCount:              0,
+		},
+		"OnlyCLI": {
+			cliCredentials:         []corev1.Secret{secret1NS1},
+			autoFetchedCredentials: nil,
+			want:                   map[string]bool{"ns1/secret1": true},
+			wantCount:              1,
+		},
+		"OnlyAutoFetched": {
+			cliCredentials:         nil,
+			autoFetchedCredentials: []corev1.Secret{secret2NS2},
+			want:                   map[string]bool{"ns2/secret2": true},
+			wantCount:              1,
+		},
+		"CLIOverridesAutoFetched": {
+			cliCredentials:         []corev1.Secret{secret1CLIValue},
+			autoFetchedCredentials: []corev1.Secret{secret1AutoValue},
+			want:                   map[string]bool{"ns1/secret1": true},
+			wantCount:              1,
+		},
+		"MergesDifferentSecrets": {
+			cliCredentials:         []corev1.Secret{cliSecretNS1},
+			autoFetchedCredentials: []corev1.Secret{autoSecretNS2},
+			want:                   map[string]bool{"ns1/cli-secret": true, "ns2/auto-secret": true},
+			wantCount:              2,
+		},
+		"DuplicatesInCLIInputLastWins": {
+			cliCredentials:         []corev1.Secret{secret1First, secret1Second},
+			autoFetchedCredentials: nil,
+			want:                   map[string]bool{"ns1/secret1": true},
+			wantCount:              1,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := mergeCredentials(tc.cliCredentials, tc.autoFetchedCredentials)
+
+			if len(got) != tc.wantCount {
+				t.Errorf("mergeCredentials() returned %d secrets, want %d", len(got), tc.wantCount)
+			}
+
+			for _, secret := range got {
+				key := fmt.Sprintf("%s/%s", secret.Namespace, secret.Name)
+				if !tc.want[key] {
+					t.Errorf("mergeCredentials() unexpected secret %s", key)
+				}
+			}
+
+			// Test CLI override behavior specifically
+			if name == "CLIOverridesAutoFetched" && len(got) == 1 {
+				if string(got[0].Data["key"]) != "cli-value" {
+					t.Errorf("mergeCredentials() CLI credentials should override auto-fetched, got value %q", string(got[0].Data["key"]))
+				}
+			}
+
+			// Test that duplicates in CLI input use last-write-wins
+			if name == "DuplicatesInCLIInputLastWins" && len(got) == 1 {
+				if string(got[0].Data["key"]) != "second" {
+					t.Errorf("mergeCredentials() duplicate CLI credentials should use last value, got %q want %q", string(got[0].Data["key"]), "second")
+				}
+			}
+		})
+	}
+}
+
+func TestFetchCompositionCredentials(t *testing.T) {
+	// This tests that fetchCompositionCredentials correctly delegates to the CredentialClient.
+	// The detailed credential fetching logic is tested in credential_client_test.go.
+	var azureCredentials corev1.Secret
+	tu.NewResource("v1", "Secret", "azure-credentials").
+		InNamespace("crossplane-system").
+		BuildTyped(&azureCredentials)
+
+	tests := map[string]struct {
+		composition     *apiextensionsv1.Composition
+		mockCredentials []corev1.Secret
+		wantSecrets     int
+	}{
+		"NilComposition": {
+			composition:     nil,
+			mockCredentials: nil,
+			wantSecrets:     0,
+		},
+		"DelegatesToCredentialClient": {
+			composition: tu.NewComposition("test-comp").
+				WithCompositeTypeRef("example.org/v1", "XR1").
+				WithPipelineMode().
+				WithPipelineStep("step1", "function-msgraph", nil,
+					tu.WithCredentials("azure-creds", "crossplane-system", "azure-credentials")).
+				Build(),
+			mockCredentials: []corev1.Secret{azureCredentials},
+			wantSecrets:     1,
+		},
+		"ReturnsEmptyWhenNoCredentials": {
+			composition: tu.NewComposition("test-comp").
+				WithCompositeTypeRef("example.org/v1", "XR1").
+				WithPipelineMode().
+				WithPipelineStep("step1", "function-test", nil).
+				Build(),
+			mockCredentials: nil,
+			wantSecrets:     0,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			credentialClient := &tu.MockCredentialClient{
+				FetchCompositionCredentialsFn: func(_ context.Context, _ *apiextensionsv1.Composition) []corev1.Secret {
+					return tc.mockCredentials
+				},
+			}
+
+			processor := &DefaultDiffProcessor{
+				credentialClient: credentialClient,
+				config: ProcessorConfig{
+					Logger: tu.TestLogger(t, false),
+				},
+			}
+
+			secrets := processor.fetchCompositionCredentials(t.Context(), tc.composition)
+
+			if len(secrets) != tc.wantSecrets {
+				t.Errorf("fetchCompositionCredentials() returned %d secrets, want %d", len(secrets), tc.wantSecrets)
+			}
+		})
+	}
+}
+
+// TestDefaultDiffProcessor_RenderToStableState_SchemaPlumbing asserts that
+// resolveSchemaAndXRDForRender pins the right composite.Schema on the input
+// *cmp.Unstructured the render function receives. Schema selection follows
+// the XRD's spec.scope: LegacyCluster -> SchemaLegacy (canonical fields at
+// spec.*); anything else -> SchemaModern (canonical fields at
+// spec.crossplane.*). Pinning here is required so the renderer writes
+// canonical fields at the path the cluster CRD declares.
+func TestDefaultDiffProcessor_RenderToStableState_SchemaPlumbing(t *testing.T) {
+	ctx := t.Context()
+
+	xr := tu.NewResource("example.org/v1", "XLegacy", "test-xr").BuildUComposite()
+	composition := &apiextensionsv1.Composition{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-composition"},
+		Spec:       apiextensionsv1.CompositionSpec{Mode: apiextensionsv1.CompositionModePipeline},
+	}
+
+	// resolveSchemaAndXRDForRender derives the schema from the XRD's
+	// spec.scope (LegacyCluster -> SchemaLegacy; anything else ->
+	// SchemaModern), so this test drives the schema decision via the
+	// XRD's scope field rather than mocking GetCompositeSchema.
+	tests := map[string]struct {
+		scope      string
+		wantSchema cmp.Schema
+	}{
+		"LegacyXRD_SchemaLegacy": {
+			scope:      "LegacyCluster",
+			wantSchema: cmp.SchemaLegacy,
+		},
+		"ModernXRD_SchemaModern": {
+			scope:      "Cluster",
+			wantSchema: cmp.SchemaModern,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var capturedSchema cmp.Schema
+
+			renderFn := func(_ context.Context, _ logging.Logger, in RenderInputs) (render.CompositionOutputs, error) {
+				capturedSchema = in.CompositeResource.Schema
+				return render.CompositionOutputs{CompositeResource: in.CompositeResource}, nil
+			}
+
+			xrd := tu.NewResource("apiextensions.crossplane.io/v2", "CompositeResourceDefinition", "xrd-test").
+				WithSpecField("scope", tt.scope).
+				Build()
+
+			defClient := tu.NewMockDefinitionClient().Build()
+			defClient.GetXRDForXRFn = func(_ context.Context, _ schema.GroupVersionKind) (*un.Unstructured, error) {
+				return xrd, nil
+			}
+
+			opts := append(testProcessorOptions(t),
+				WithRenderFunc(renderFn),
+			)
+			processor := NewDiffProcessor(k8.Clients{}, xp.Clients{Definition: defClient}, opts...)
+
+			out, err := processor.(*DefaultDiffProcessor).RenderToStableState(
+				ctx, xr, composition, nil, "XR/test-xr", nil, false,
+			)
+			if err != nil {
+				t.Fatalf("RenderToStableState() unexpected error: %v", err)
+			}
+
+			if capturedSchema != tt.wantSchema {
+				t.Errorf("input.CompositeResource.Schema = %v, want %v", capturedSchema, tt.wantSchema)
+			}
+
+			if out.CompositeResource == nil {
+				t.Fatal("output CompositeResource is nil")
+			}
+
+			if out.CompositeResource.Schema != tt.wantSchema {
+				t.Errorf("output.CompositeResource.Schema = %v, want %v",
+					out.CompositeResource.Schema, tt.wantSchema)
+			}
+		})
+	}
+}

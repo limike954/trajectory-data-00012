@@ -1,0 +1,411 @@
+/*
+Copyright 2025 The Crossplane Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package diffprocessor
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"time"
+
+	xp "github.com/limike954/trajectory-data-00012/cmd/diff/client/crossplane"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
+
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
+
+	apiextensionsv1 "github.com/crossplane/crossplane/apis/v2/apiextensions/v1"
+	pkgv1 "github.com/crossplane/crossplane/apis/v2/pkg/v1"
+)
+
+// FunctionProvider provides functions for rendering compositions.
+// Different implementations can fetch functions on-demand or return cached functions.
+type FunctionProvider interface {
+	// GetFunctionsForComposition returns the functions needed to render a composition.
+	GetFunctionsForComposition(comp *apiextensionsv1.Composition) ([]pkgv1.Function, error)
+
+	// Cleanup stops and removes any resources created during function execution.
+	// For providers that don't create resources (like DefaultFunctionProvider), this is a no-op.
+	Cleanup(ctx context.Context) error
+}
+
+// EnvDockerNetwork is the environment variable that specifies which Docker
+// network the crossplane-render container and function containers should
+// join. NewEngineRenderFn reads this once and routes the value through
+// render.EngineFlags.CrossplaneDockerNetwork; the upstream docker engine
+// then both runs the render container on that network and annotates fns
+// to join it at Setup time. This is needed when crossplane-diff runs
+// inside a Docker container (e.g. a GitHub Actions container job).
+const EnvDockerNetwork = "CROSSPLANE_DIFF_DOCKER_NETWORK"
+
+// DefaultFunctionProvider fetches functions from the cluster on each call.
+// This is appropriate for the xr command where each XR is processed independently.
+type DefaultFunctionProvider struct {
+	fnClient xp.FunctionClient
+	logger   logging.Logger
+}
+
+// NewDefaultFunctionProvider creates a new DefaultFunctionProvider.
+func NewDefaultFunctionProvider(fnClient xp.FunctionClient, logger logging.Logger) FunctionProvider {
+	return &DefaultFunctionProvider{
+		fnClient: fnClient,
+		logger:   logger,
+	}
+}
+
+// GetFunctionsForComposition fetches functions from the cluster.
+func (p *DefaultFunctionProvider) GetFunctionsForComposition(comp *apiextensionsv1.Composition) ([]pkgv1.Function, error) {
+	p.logger.Debug("Fetching functions from pipeline", "composition", comp.GetName())
+
+	fns, err := p.fnClient.GetFunctionsFromPipeline(comp)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot get functions from pipeline")
+	}
+
+	p.logger.Debug("Fetched functions from pipeline", "composition", comp.GetName(), "count", len(fns))
+
+	return fns, nil
+}
+
+// Cleanup is a no-op for DefaultFunctionProvider as it doesn't create any resources.
+func (p *DefaultFunctionProvider) Cleanup(_ context.Context) error {
+	return nil
+}
+
+// CachedFunctionProvider lazy-loads and caches functions with reuse annotations.
+// This is appropriate for the comp command where many XRs use the same composition,
+// allowing Docker containers to be reused across renders.
+type CachedFunctionProvider struct {
+	fnClient       xp.FunctionClient
+	cache          map[string][]pkgv1.Function
+	containerNames []string // Track container names for cleanup
+	instanceID     string   // Unique identifier for this provider instance
+	logger         logging.Logger
+}
+
+// NewCachedFunctionProvider creates a new CachedFunctionProvider.
+func NewCachedFunctionProvider(fnClient xp.FunctionClient, logger logging.Logger) FunctionProvider {
+	return &CachedFunctionProvider{
+		fnClient:       fnClient,
+		cache:          make(map[string][]pkgv1.Function),
+		containerNames: make([]string, 0),
+		instanceID:     generateInstanceID(),
+		logger:         logger,
+	}
+}
+
+// generateInstanceID creates a short random identifier for this provider instance.
+// This ensures container names are unique across different provider instances and test runs.
+func generateInstanceID() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to a timestamp-based approach if crypto/rand fails
+		// This is extremely unlikely but we handle it for completeness
+		return fmt.Sprintf("%x", time.Now().UnixNano()&0xFFFFFFFF)
+	}
+
+	return hex.EncodeToString(b)
+}
+
+// GetFunctionsForComposition fetches and caches functions on first call per composition.
+func (p *CachedFunctionProvider) GetFunctionsForComposition(comp *apiextensionsv1.Composition) ([]pkgv1.Function, error) {
+	compName := comp.GetName()
+
+	if cached, ok := p.cache[compName]; ok {
+		p.logger.Debug("Using cached functions", "composition", compName, "count", len(cached))
+		return cached, nil
+	}
+
+	// Cache miss - fetch and cache functions
+	p.logger.Debug("Fetching functions for caching", "composition", compName)
+
+	fns, err := p.fnClient.GetFunctionsFromPipeline(comp)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot get functions from pipeline")
+	}
+
+	p.logger.Debug("Fetched functions for caching", "composition", compName, "count", len(fns))
+
+	// Add reuse annotations to each function
+	for i := range fns {
+		fn := &fns[i]
+
+		// Generate a stable container name from the function package and instance ID
+		// The instance ID ensures containers are unique across provider instances and test runs
+		containerName := generateContainerName(fn.Spec.Package, p.instanceID)
+
+		p.logger.Debug("Adding reuse annotations to function",
+			"function", fn.GetName(),
+			"package", fn.Spec.Package,
+			"containerName", containerName,
+			"instanceID", p.instanceID)
+
+		// Initialize annotations map if it doesn't exist
+		if fn.Annotations == nil {
+			fn.Annotations = make(map[string]string)
+		}
+
+		// Add Docker reuse annotations
+		// Containers will be cleaned up via Cleanup() method called by comp command
+		fn.Annotations["render.crossplane.io/runtime-docker-name"] = containerName
+		fn.Annotations["render.crossplane.io/runtime-docker-cleanup"] = "Orphan"
+
+		// Track container name for cleanup
+		p.containerNames = append(p.containerNames, containerName)
+	}
+
+	// Cache for future calls
+	p.cache[compName] = fns
+
+	return fns, nil
+}
+
+// Cleanup stops and removes Docker containers created during function execution.
+func (p *CachedFunctionProvider) Cleanup(ctx context.Context) error {
+	if len(p.containerNames) == 0 {
+		p.logger.Debug("No containers to clean up")
+		return nil
+	}
+
+	p.logger.Info("Cleaning up function containers", "count", len(p.containerNames))
+
+	// Create Docker client
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		p.logger.Debug("Failed to create Docker client", "error", err)
+		return nil // Graceful degradation - don't fail cleanup
+	}
+
+	defer func() {
+		if err := cli.Close(); err != nil {
+			p.logger.Debug("Error closing Docker client", "error", err)
+		}
+	}()
+
+	var errs []error
+
+	for _, containerName := range p.containerNames {
+		// List containers matching this name
+		filterArgs := filters.NewArgs()
+		filterArgs.Add("name", fmt.Sprintf("^%s$", containerName))
+
+		containers, err := cli.ContainerList(ctx, container.ListOptions{
+			All:     true,
+			Filters: filterArgs,
+		})
+		if err != nil {
+			p.logger.Debug("Error listing containers", "container", containerName, "error", err)
+			continue
+		}
+
+		// Skip if container doesn't exist
+		if len(containers) == 0 {
+			p.logger.Debug("Container does not exist, skipping", "container", containerName)
+			continue
+		}
+
+		// Remove the container (force=true stops and removes)
+		p.logger.Debug("Stopping and removing container", "container", containerName)
+
+		removeOpts := container.RemoveOptions{
+			Force: true, // Stop and remove
+		}
+		if err := cli.ContainerRemove(ctx, containers[0].ID, removeOpts); err != nil {
+			p.logger.Debug("Error removing container", "container", containerName, "error", err)
+			errs = append(errs, errors.Wrapf(err, "failed to remove container %s", containerName))
+		} else {
+			p.logger.Debug("Successfully removed container", "container", containerName)
+		}
+	}
+
+	if len(errs) > 0 {
+		// Don't fail the entire cleanup if some containers couldn't be removed
+		// Log the error but return nil to allow graceful degradation
+		p.logger.Info("Some containers could not be cleaned up", "errors", len(errs))
+
+		for _, err := range errs {
+			p.logger.Debug("Cleanup error", "error", err)
+		}
+	}
+
+	return nil
+}
+
+// maxContainerNameLength is the maximum length for Docker container names.
+// While Docker doesn't enforce a strict limit, DNS hostname compatibility
+// and various orchestration tools typically limit names to 63 characters.
+const maxContainerNameLength = 63
+
+// generateContainerName creates a stable Docker container name from a function package reference and instance ID.
+// The instance ID ensures containers are unique across provider instances and test runs to avoid race conditions.
+// Example: xpkg.crossplane.io/crossplane-contrib/function-go-templating:v0.11.0 with instanceID "a1b2c3d4"
+// Returns: function-go-templating-v0.11.0-comp-a1b2c3d4
+//
+// For SHA256 digest references, the digest is truncated to 12 characters (similar to Docker short IDs):
+// Example: function-go-templating@sha256:54726c28b78f... -> function-go-templating-54726c28b78f-comp-a1b2c3d4
+//
+// If the resulting name exceeds 63 characters, the function name is truncated and a hash suffix is added
+// to maintain uniqueness.
+func generateContainerName(pkg, instanceID string) string {
+	// Handle empty package string
+	if pkg == "" {
+		return fmt.Sprintf("unknown-comp-%s", instanceID)
+	}
+
+	// Split package into path and version/digest
+	// Format: registry/org/name:version or registry/org/name@sha256:digest
+	parts := strings.Split(pkg, "/")
+
+	// Get the last part (name:version or name@sha256:digest)
+	nameAndVersion := parts[len(parts)-1]
+
+	var containerName string
+
+	// Handle SHA256 digest references: name@sha256:digest
+	// Extract just the function name and a truncated digest
+	if before, after, ok := strings.Cut(nameAndVersion, "@sha256:"); ok {
+		funcName := strings.ReplaceAll(before, ":", "-")
+		digest := after
+
+		// Use first 12 chars of digest (like Docker short image IDs)
+		if len(digest) > 12 {
+			digest = digest[:12]
+		}
+
+		containerName = fmt.Sprintf("%s-%s-comp-%s", funcName, digest, instanceID)
+	} else {
+		// Standard tag reference: name:version
+		// Replace colon with hyphen to make it container-name friendly
+		// function-go-templating:v0.11.0 -> function-go-templating-v0.11.0
+		containerName = strings.ReplaceAll(nameAndVersion, ":", "-")
+
+		// Add suffix and instance ID to make it unique per provider instance
+		containerName += fmt.Sprintf("-comp-%s", instanceID)
+	}
+
+	// Truncate if needed to respect DNS hostname length limits
+	if len(containerName) > maxContainerNameLength {
+		containerName = truncateContainerName(containerName, pkg, instanceID)
+	}
+
+	return containerName
+}
+
+// RegistryOverrideFunctionProvider wraps another FunctionProvider and replaces
+// the registry in each function's package reference before returning them.
+type RegistryOverrideFunctionProvider struct {
+	inner    FunctionProvider
+	registry string
+	logger   logging.Logger
+}
+
+// NewRegistryOverrideFunctionProvider wraps inner, replacing the registry
+// portion of every function package ref with the given registry.
+func NewRegistryOverrideFunctionProvider(inner FunctionProvider, registry string, logger logging.Logger) FunctionProvider {
+	return &RegistryOverrideFunctionProvider{
+		inner:    inner,
+		registry: registry,
+		logger:   logger,
+	}
+}
+
+// GetFunctionsForComposition delegates to the wrapped provider and rewrites
+// the registry portion of each returned function's package ref.
+func (p *RegistryOverrideFunctionProvider) GetFunctionsForComposition(comp *apiextensionsv1.Composition) ([]pkgv1.Function, error) {
+	fns, err := p.inner.GetFunctionsForComposition(comp)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range fns {
+		orig := fns[i].Spec.Package
+
+		replaced := replaceRegistry(orig, p.registry)
+		if replaced != orig {
+			p.logger.Debug("Overriding function registry",
+				"function", fns[i].GetName(),
+				"from", orig,
+				"to", replaced)
+			fns[i].Spec.Package = replaced
+		}
+	}
+
+	return fns, nil
+}
+
+// Cleanup delegates to the wrapped provider.
+func (p *RegistryOverrideFunctionProvider) Cleanup(ctx context.Context) error {
+	return p.inner.Cleanup(ctx)
+}
+
+// replaceRegistry replaces the registry portion of an OCI package reference,
+// preserving the repository path, tag, and/or digest. A trailing slash on
+// newRegistry is trimmed.
+//
+// The first path component is treated as a registry host only when it follows
+// the standard OCI rule: it contains a '.' or ':', or it is exactly
+// "localhost". Otherwise the ref has no explicit registry (e.g.
+// "crossplane-contrib/function-auto-ready:v1.0.0") and newRegistry is prepended
+// to the full ref instead of replacing the first path segment.
+func replaceRegistry(pkg, newRegistry string) string {
+	newRegistry = strings.TrimRight(newRegistry, "/")
+
+	idx := strings.Index(pkg, "/")
+	if idx < 0 {
+		return newRegistry + "/" + pkg
+	}
+
+	first := pkg[:idx]
+	if !strings.ContainsAny(first, ".:") && first != "localhost" {
+		return newRegistry + "/" + pkg
+	}
+
+	return newRegistry + pkg[idx:]
+}
+
+// truncateContainerName shortens a container name to fit within maxContainerNameLength
+// while maintaining uniqueness via a hash suffix derived from the original package name.
+func truncateContainerName(name, pkg, instanceID string) string {
+	// Create a hash of the full package name for uniqueness
+	hash := sha256.Sum256([]byte(pkg))
+	hashSuffix := hex.EncodeToString(hash[:])[:8]
+
+	// Format: <truncated-name>-<hash>-comp-<instanceID>
+	// Suffix length: 1 (dash) + 8 (hash) + 6 (-comp-) + 8 (instanceID) = 23 chars
+	suffixLen := 1 + 8 + 6 + len(instanceID)
+	maxNameLen := maxContainerNameLength - suffixLen
+
+	// Truncate the base name (everything before -comp-)
+	baseName := name
+	if idx := strings.LastIndex(name, "-comp-"); idx != -1 {
+		baseName = name[:idx]
+	}
+
+	if len(baseName) > maxNameLen {
+		baseName = baseName[:maxNameLen]
+	}
+
+	// Remove trailing hyphens from truncation
+	baseName = strings.TrimRight(baseName, "-")
+
+	return fmt.Sprintf("%s-%s-comp-%s", baseName, hashSuffix, instanceID)
+}

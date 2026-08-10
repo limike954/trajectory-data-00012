@@ -1,0 +1,40 @@
++++ ClusterNopResource/new-resource-(generated)
++ apiVersion: nop.crossplane.io/v1alpha1
++ kind: ClusterNopResource
++ metadata:
++   annotations:
++     cool-field: I'm new!
++     crossplane.io/composition-resource-name: nop-resource
++     setting: value1
++   generateName: new-resource-
++   labels:
++     crossplane.io/composite: new-resource
++ spec:
++   deletionPolicy: Delete
++   forProvider:
++     conditionAfter:
++     - conditionStatus: "True"
++       conditionType: Ready
++       time: 0s
++   managementPolicies:
++   - '*'
++   providerConfigRef:
++     name: default
+
+---
++++ XNopResource/new-resource
++ apiVersion: legacy.diff.example.org/v1alpha1
++ kind: XNopResource
++ metadata:
++   name: new-resource
++ spec:
++   compositionUpdatePolicy: Automatic
++   coolField: I'm new!
++   parameters:
++     config:
++       setting1: value1
++       setting2: value2
+
+---
+
+Summary: 2 added

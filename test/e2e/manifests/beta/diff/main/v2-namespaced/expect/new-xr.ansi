@@ -1,0 +1,43 @@
++++ NopResource/new-resource-(generated)
++ apiVersion: nop.crossplane.io/v1alpha1
++ kind: NopResource
++ metadata:
++   annotations:
++     cool-field: I'm new!
++     crossplane.io/composition-resource-name: nop-resource
++     setting: value1
++   generateName: new-resource-
++   labels:
++     crossplane.io/composite: new-resource
++   namespace: default
++ spec:
++   deletionPolicy: Delete
++   forProvider:
++     conditionAfter:
++     - conditionStatus: "True"
++       conditionType: Ready
++       time: 0s
++   managementPolicies:
++   - '*'
++   providerConfigRef:
++     name: default
+
+---
++++ XNopResource/new-resource
++ apiVersion: diff.example.org/v1alpha1
++ kind: XNopResource
++ metadata:
++   name: new-resource
++   namespace: default
++ spec:
++   coolField: I'm new!
++   crossplane:
++     compositionUpdatePolicy: Automatic
++   parameters:
++     config:
++       setting1: value1
++       setting2: value2
+
+---
+
+Summary: 2 added

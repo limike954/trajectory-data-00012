@@ -1,0 +1,521 @@
+/*
+Copyright 2025 The Crossplane Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package renderer
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	dt "github.com/limike954/trajectory-data-00012/cmd/diff/renderer/types"
+	sigsyaml "sigs.k8s.io/yaml"
+
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
+)
+
+const (
+	headerCompositionChanges = "=== Composition Changes ==="
+	headerAffectedResources  = "=== Affected Composite Resources ==="
+	headerImpactAnalysis     = "=== Impact Analysis ==="
+)
+
+// CompDiffRenderer renders composition diff results.
+// Both human-readable and structured (JSON/YAML) renderers implement this interface.
+type CompDiffRenderer interface {
+	// RenderCompDiff renders the complete composition diff output.
+	// Top-level and tool errors go to DiffOptions.Stderr and are included in
+	// structured output payloads. Per-composition messages (diffs, "no changes",
+	// per-composition errors) go to DiffOptions.Stdout as part of the diff narrative.
+	RenderCompDiff(output *CompDiffOutput) error
+}
+
+// DefaultCompDiffRenderer renders composition diffs in human-readable format.
+type DefaultCompDiffRenderer struct {
+	logger       logging.Logger
+	diffRenderer DiffRenderer
+	opts         DiffOptions
+}
+
+// NewDefaultCompDiffRenderer creates a new human-readable composition diff renderer.
+func NewDefaultCompDiffRenderer(logger logging.Logger, diffRenderer DiffRenderer, opts DiffOptions) CompDiffRenderer {
+	return &DefaultCompDiffRenderer{
+		logger:       logger,
+		diffRenderer: diffRenderer,
+		opts:         opts,
+	}
+}
+
+// RenderCompDiff renders the composition diff in human-readable format.
+// Top-level errors go to r.opts.Stderr. Per-composition output (diffs, status
+// messages, per-composition errors) goes to r.opts.Stdout.
+func (r *DefaultCompDiffRenderer) RenderCompDiff(output *CompDiffOutput) error {
+	stdout := r.opts.Stdout
+
+	for i, comp := range output.Compositions {
+		if i > 0 {
+			if _, err := fmt.Fprint(stdout, "\n"+strings.Repeat("=", 80)+"\n\n"); err != nil {
+				return errors.Wrap(err, "cannot write composition separator")
+			}
+		}
+
+		switch {
+		case r.opts.MinimizeComposition:
+			if err := r.renderMinimizedCompositionChanges(&comp); err != nil {
+				return err
+			}
+		default:
+			if err := r.renderCompositionChanges(&comp); err != nil {
+				return err
+			}
+		}
+
+		// Skip remaining sections if composition had a processing error
+		if comp.Error != nil {
+			continue
+		}
+
+		// Render affected XRs list with status indicators
+		if err := r.renderAffectedResourcesList(&comp); err != nil {
+			return err
+		}
+
+		// Render impact analysis (downstream diffs)
+		if err := r.renderImpactAnalysis(&comp); err != nil {
+			return err
+		}
+	}
+
+	// Write top-level errors to stderr
+	for _, e := range output.Errors {
+		if _, err := fmt.Fprintln(r.opts.Stderr, e.FormatError()); err != nil {
+			return errors.Wrap(err, "failed to write error to stderr")
+		}
+	}
+
+	return nil
+}
+
+// renderCompositionChanges renders the composition changes section.
+func (r *DefaultCompDiffRenderer) renderCompositionChanges(comp *CompositionDiff) error {
+	stdout := r.opts.Stdout
+
+	if _, err := fmt.Fprintf(stdout, headerCompositionChanges+"\n\n"); err != nil {
+		return errors.Wrap(err, "cannot write composition changes header")
+	}
+
+	// Check for composition processing error first
+	if comp.Error != nil {
+		if _, err := fmt.Fprintf(stdout, "Error processing composition %s: %s\n\n", comp.Name, comp.Error.Error()); err != nil {
+			return errors.Wrap(err, "cannot write composition error")
+		}
+
+		return nil
+	}
+
+	if comp.CompositionDiff == nil || comp.CompositionDiff.DiffType == dt.DiffTypeEqual {
+		if _, err := fmt.Fprintf(stdout, "No changes detected in composition %s\n\n", comp.Name); err != nil {
+			return errors.Wrap(err, "cannot write no changes message")
+		}
+
+		return nil
+	}
+
+	diffs := map[string]*dt.ResourceDiff{
+		fmt.Sprintf("Composition/%s", comp.Name): comp.CompositionDiff,
+	}
+
+	if err := r.diffRenderer.RenderDiffs(diffs, nil); err != nil {
+		return errors.Wrap(err, "cannot render composition diff")
+	}
+
+	if _, err := fmt.Fprintf(stdout, "\n"); err != nil {
+		return errors.Wrap(err, "cannot write separator")
+	}
+
+	return nil
+}
+
+// renderMinimizedCompositionChanges renders a single marker line per composition
+// instead of the full YAML diff body. Errors and no-change compositions are
+// shown as usual (i.e., not minimized); only changed compositions are collapsed.
+func (r *DefaultCompDiffRenderer) renderMinimizedCompositionChanges(comp *CompositionDiff) error {
+	stdout := r.opts.Stdout
+
+	if _, err := fmt.Fprintf(stdout, headerCompositionChanges+"\n\n"); err != nil {
+		return errors.Wrap(err, "cannot write composition changes header")
+	}
+
+	if comp.Error != nil {
+		if _, err := fmt.Fprintf(stdout, "Error processing composition %s: %s\n\n", comp.Name, comp.Error.Error()); err != nil {
+			return errors.Wrap(err, "cannot write composition error")
+		}
+
+		return nil
+	}
+
+	if comp.CompositionDiff == nil || comp.CompositionDiff.DiffType == dt.DiffTypeEqual {
+		if _, err := fmt.Fprintf(stdout, "No changes detected in composition %s\n\n", comp.Name); err != nil {
+			return errors.Wrap(err, "cannot write no changes message")
+		}
+
+		return nil
+	}
+
+	marker := strings.Repeat(string(comp.CompositionDiff.DiffType), 3)
+
+	color, resetColor := "", ""
+
+	if r.opts.UseColors {
+		switch comp.CompositionDiff.DiffType {
+		case dt.DiffTypeModified:
+			color = dt.ColorYellow
+		case dt.DiffTypeAdded:
+			color = dt.ColorGreen
+		case dt.DiffTypeRemoved:
+			color = dt.ColorRed
+		case dt.DiffTypeEqual:
+			// no color for equal
+		}
+
+		resetColor = dt.ColorReset
+	}
+
+	if _, err := fmt.Fprintf(stdout, "%s%s Composition/%s (minimized)%s\n\n", color, marker, comp.Name, resetColor); err != nil {
+		return errors.Wrap(err, "cannot write minimized composition line")
+	}
+
+	return nil
+}
+
+// renderAffectedResourcesList renders the affected XRs list with status indicators.
+func (r *DefaultCompDiffRenderer) renderAffectedResourcesList(comp *CompositionDiff) error {
+	stdout := r.opts.Stdout
+
+	if len(comp.ImpactAnalysis) == 0 {
+		// No XRs surfaced. Either none were found, or all matched-by-name XRs were filtered out
+		// (by Manual policy and/or revision-selector mismatch); report the breakdown if so.
+		byPolicy := comp.AffectedResources.FilteredByPolicy
+		bySelector := comp.AffectedResources.FilteredBySelector
+
+		switch {
+		case byPolicy > 0 || bySelector > 0:
+			if _, err := fmt.Fprintf(stdout, "%s\n", allFilteredMessage(comp.Name, byPolicy, bySelector)); err != nil {
+				return errors.Wrap(err, "cannot write filtered XRs message")
+			}
+		default:
+			if _, err := fmt.Fprintf(stdout, "No XRs found using composition %s\n", comp.Name); err != nil {
+				return errors.Wrap(err, "cannot write no XRs message")
+			}
+		}
+
+		return nil
+	}
+
+	// Build the XR list with status indicators
+	xrList := r.buildXRStatusList(comp.ImpactAnalysis)
+
+	// Generate summary line
+	summary := formatXRStatusSummary(
+		comp.AffectedResources.WithChanges,
+		comp.AffectedResources.Unchanged,
+		comp.AffectedResources.WithErrors,
+	)
+
+	// Write the XR list with summary
+	if _, err := fmt.Fprintf(stdout, headerAffectedResources+"\n\n%s%s\n", xrList, summary); err != nil {
+		return errors.Wrap(err, "cannot write XR list")
+	}
+
+	return nil
+}
+
+// renderImpactAnalysis renders the impact analysis section with downstream diffs.
+func (r *DefaultCompDiffRenderer) renderImpactAnalysis(comp *CompositionDiff) error {
+	stdout := r.opts.Stdout
+
+	if _, err := fmt.Fprintf(stdout, headerImpactAnalysis+"\n\n"); err != nil {
+		return errors.Wrap(err, "cannot write impact analysis header")
+	}
+
+	// Collect all diffs from the impact analysis using stored ResourceDiffs.
+	allDiffs := make(map[string]*dt.ResourceDiff)
+
+	for _, impact := range comp.ImpactAnalysis {
+		if impact.Status == XRStatusChanged && impact.Diffs != nil {
+			for key, diff := range impact.Diffs {
+				// Skip equal diffs (may be stored for removal detection purposes)
+				if diff.DiffType != dt.DiffTypeEqual {
+					allDiffs[key] = diff
+				}
+			}
+		}
+	}
+
+	// Render all diffs if we found some, or show a message if empty
+	if len(allDiffs) > 0 {
+		if err := r.diffRenderer.RenderDiffs(allDiffs, nil); err != nil {
+			r.logger.Debug("Failed to render diffs", "error", err)
+			return errors.Wrap(err, "failed to render diffs")
+		}
+	} else {
+		if _, err := fmt.Fprint(stdout, "All composite resources are up-to-date. No downstream resource changes detected.\n\n"); err != nil {
+			return errors.Wrap(err, "cannot write empty impact message")
+		}
+	}
+
+	return nil
+}
+
+// allFilteredMessage builds the default-discovery summary line for the case where every
+// matched-by-name XR was filtered out, breaking the total down by reason so users understand why
+// nothing is shown and how to see more.
+func allFilteredMessage(compName string, byPolicy, bySelector int) string {
+	total := byPolicy + bySelector
+
+	switch {
+	case byPolicy > 0 && bySelector > 0:
+		return fmt.Sprintf("All %d XR(s) using composition %s were filtered: %d with Manual update policy (use --include-manual to see them), %d with a compositionRevisionSelector that does not match the composition's labels",
+			total, compName, byPolicy, bySelector)
+	case bySelector > 0:
+		return fmt.Sprintf("All %d XR(s) using composition %s have a compositionRevisionSelector that does not match the composition's labels, so they would not adopt this revision",
+			total, compName)
+	default:
+		return fmt.Sprintf("All %d XR(s) using composition %s have Manual update policy (use --include-manual to see them)",
+			total, compName)
+	}
+}
+
+// filteredSuffix returns the human-readable explanation appended to a filtered XR line, chosen by
+// the XR's FilterReason. Selector-mismatch entries additionally surface the concrete FilterDetail
+// hint (which selector failed to match which labels) so users can self-diagnose the exclusion.
+func filteredSuffix(impact XRImpact) string {
+	switch impact.FilterReason {
+	case FilterReasonManualPolicy:
+		return " — filtered: Manual update policy (use --include-manual to evaluate)"
+	case FilterReasonRevisionSelectorMismatch:
+		if impact.FilterDetail != "" {
+			return fmt.Sprintf(" — filtered: revision selector mismatch (%s)", impact.FilterDetail)
+		}
+
+		return " — filtered: revision selector mismatch"
+	default:
+		return " — filtered"
+	}
+}
+
+// buildXRStatusList builds the XR list with status indicators.
+func (r *DefaultCompDiffRenderer) buildXRStatusList(impacts []XRImpact) string {
+	var sb strings.Builder
+
+	// Color codes and indicators
+	checkMark := "\u2713"
+	warningMark := "\u26a0"
+	errorMark := "\u2717"
+	colorGreen := ""
+	colorYellow := ""
+	colorRed := ""
+	colorReset := ""
+
+	if r.opts.UseColors {
+		colorGreen = dt.ColorGreen
+		colorYellow = dt.ColorYellow
+		colorRed = dt.ColorRed
+		colorReset = dt.ColorReset
+	}
+
+	for _, impact := range impacts {
+		// Format namespace/scope information
+		scope := fmt.Sprintf("namespace: %s", impact.Namespace)
+		if impact.Namespace == "" {
+			scope = "cluster-scoped"
+		}
+
+		// Determine status indicator and color based on status
+		var (
+			indicator, color string
+			suffix           string
+		)
+
+		switch impact.Status {
+		case XRStatusError:
+			indicator = errorMark
+			color = colorRed
+		case XRStatusChanged:
+			indicator = warningMark
+			color = colorYellow
+		case XRStatusUnchanged:
+			indicator = checkMark
+			color = colorGreen
+		case XRStatusFiltered:
+			indicator = "⊘" // ⊘
+			color = colorYellow
+			suffix = filteredSuffix(impact)
+		}
+
+		fmt.Fprintf(&sb, "%s  %s %s/%s (%s)%s%s\n",
+			color,
+			indicator,
+			impact.Kind, impact.Name, scope,
+			suffix,
+			colorReset)
+
+		// Include error details for XRStatusError impacts so users can diagnose issues.
+		if impact.Status == XRStatusError && impact.Error != nil {
+			fmt.Fprintf(&sb, "%s    Error: %s%s\n", color, impact.Error.Error(), colorReset)
+		}
+	}
+
+	return sb.String()
+}
+
+// StructuredCompDiffRenderer renders composition diffs in JSON/YAML format.
+type StructuredCompDiffRenderer struct {
+	logger logging.Logger
+	opts   DiffOptions
+}
+
+// NewStructuredCompDiffRenderer creates a new structured composition diff renderer.
+func NewStructuredCompDiffRenderer(logger logging.Logger, opts DiffOptions) CompDiffRenderer {
+	return &StructuredCompDiffRenderer{
+		logger: logger,
+		opts:   opts,
+	}
+}
+
+// RenderCompDiff renders the composition diff in structured format (JSON/YAML).
+// Top-level errors go to both r.opts.Stderr (for human visibility) and the
+// structured output payload. Per-composition data goes to r.opts.Stdout.
+func (r *StructuredCompDiffRenderer) RenderCompDiff(output *CompDiffOutput) error {
+	// Convert internal representation to JSON output structure
+	jsonOutput := r.buildStructuredCompOutput(output)
+
+	var (
+		data []byte
+		err  error
+	)
+
+	switch r.opts.Format {
+	case OutputFormatJSON:
+		data, err = json.MarshalIndent(jsonOutput, "", "  ")
+	case OutputFormatYAML:
+		data, err = sigsyaml.Marshal(jsonOutput)
+	case OutputFormatDiff:
+		fallthrough
+	default:
+		return errors.Errorf("unsupported format for structured comp diff renderer: %s", r.opts.Format)
+	}
+
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal comp diff output")
+	}
+
+	_, err = r.opts.Stdout.Write(append(data, '\n'))
+	if err != nil {
+		return errors.Wrap(err, "failed to write output")
+	}
+
+	// Write errors to stderr for human visibility (they're also included in the structured output)
+	for _, e := range output.Errors {
+		if _, err := fmt.Fprintln(r.opts.Stderr, e.FormatError()); err != nil {
+			return errors.Wrap(err, "failed to write error to stderr")
+		}
+	}
+
+	return nil
+}
+
+// buildStructuredCompOutput converts internal CompDiffOutput to JSON-serializable structure.
+func (r *StructuredCompDiffRenderer) buildStructuredCompOutput(output *CompDiffOutput) *compDiffJSONOutput {
+	result := &compDiffJSONOutput{
+		Compositions: make([]compositionDiffJSON, 0, len(output.Compositions)),
+		Errors:       output.Errors,
+	}
+
+	for _, comp := range output.Compositions {
+		jsonComp := compositionDiffJSON{
+			Name:              comp.Name,
+			AffectedResources: comp.AffectedResources,
+			ImpactAnalysis:    make([]xrImpactJSON, 0, len(comp.ImpactAnalysis)),
+		}
+
+		// Include per-composition error if present
+		if comp.Error != nil {
+			jsonComp.Error = comp.Error.Error()
+		}
+
+		// Convert composition diff if present and not equal.
+		if comp.CompositionDiff != nil && comp.CompositionDiff.DiffType != dt.DiffTypeEqual {
+			jsonComp.CompositionChanges = resourceDiffToChangeDetail(comp.CompositionDiff)
+		}
+
+		// Convert each XR impact
+		for _, impact := range comp.ImpactAnalysis {
+			jsonImpact := xrImpactJSON{
+				ObjectReference: impact.ObjectReference,
+				Status:          impact.Status,
+				FilterReason:    impact.FilterReason,
+				FilterDetail:    impact.FilterDetail,
+			}
+			if impact.Error != nil {
+				jsonImpact.Error = impact.Error.Error()
+			}
+
+			if impact.Status == XRStatusChanged && len(impact.Diffs) > 0 {
+				jsonImpact.DownstreamChanges = buildDownstreamChanges(impact.Diffs)
+			}
+
+			jsonComp.ImpactAnalysis = append(jsonComp.ImpactAnalysis, jsonImpact)
+		}
+
+		result.Compositions = append(result.Compositions, jsonComp)
+	}
+
+	return result
+}
+
+// formatXRStatusSummary generates the summary line with correct pluralization.
+func formatXRStatusSummary(changedCount, unchangedCount, errorCount int) string {
+	parts := []string{}
+
+	if changedCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d resource%s with changes", changedCount, pluralize(changedCount)))
+	}
+
+	if unchangedCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d resource%s unchanged", unchangedCount, pluralize(unchangedCount)))
+	}
+
+	if errorCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d resource%s with errors", errorCount, pluralize(errorCount)))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("\nSummary: %s\n", strings.Join(parts, ", "))
+}
+
+// pluralize returns "s" if count is not 1, otherwise returns empty string.
+func pluralize(count int) string {
+	if count == 1 {
+		return ""
+	}
+
+	return "s"
+}

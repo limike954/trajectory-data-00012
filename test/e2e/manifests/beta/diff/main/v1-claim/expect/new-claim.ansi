@@ -1,0 +1,41 @@
++++ ClusterNopResource/test-claim-(generated)
++ apiVersion: nop.crossplane.io/v1alpha1
++ kind: ClusterNopResource
++ metadata:
++   annotations:
++     cool-field: new-value
++     crossplane.io/composition-resource-name: nop-resource
++   generateName: test-claim-
++   labels:
++     crossplane.io/claim-name: test-claim
++     crossplane.io/claim-namespace: default
++     crossplane.io/composite: test-claim
++ spec:
++   deletionPolicy: Delete
++   forProvider:
++     conditionAfter:
++     - conditionStatus: "True"
++       conditionType: Ready
++       time: 0s
++   managementPolicies:
++   - '*'
++   providerConfigRef:
++     name: default
+
+---
++++ NopClaim/test-claim
++ apiVersion: claim.diff.example.org/v1alpha1
++ kind: NopClaim
++ metadata:
++   name: test-claim
++   namespace: default
++ spec:
++   compositeDeletePolicy: Background
++   compositionRef:
++     name: xnopclaims.claim.diff.example.org
++   compositionUpdatePolicy: Automatic
++   coolField: new-value
+
+---
+
+Summary: 2 added
